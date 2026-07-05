@@ -27,6 +27,8 @@ class AgenticBackend:
             api_key=_resolve_env(cfg.get("api_key", "none")),
             default_headers={
                 "x-openclaw-message-channel": self.message_channel,
+                "X-Hermes-Session-Id": f"voice-{device_id}",
+                "X-Hermes-Session-Key": f"voice-{device_id}",
             },
         )
 

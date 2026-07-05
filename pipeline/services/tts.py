@@ -48,6 +48,7 @@ async def _local(text: str, config: dict) -> bytes:
     payload = {
         "model": local_cfg["model"],
         "input": text,
+        "voice": local_cfg.get("voice", "af_heart"),
         "response_format": "wav",
     }
 
