@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 import numpy as np
 import yaml
 
-from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav
+from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, OpusStreamEncoder
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
@@ -251,34 +251,67 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             first_sentence_at: float | None = None
             stream_start_at: float | None = None
 
+
             async def send_sentence(sentence: str, is_final: bool) -> bool:
-                """Synthesize, encode, and push one sentence. Returns True on
-                success, False if interrupted or TTS failed."""
+                """Synthesize, encode, and push one sentence — streamed in
+                batches as TTS produces audio. Returns True on success, False
+                if interrupted or TTS failed. Non-streaming backends yield one
+                batch, reproducing the previous behavior exactly."""
                 nonlocal sent_partial
                 if device.interrupted.is_set():
                     log.info(f"Interrupted before TTS")
                     return False
+
+                enc = OpusStreamEncoder(sample_rate, opus_frame_size)
+                batch_pcm = b""
+                batch_min = sample_rate * 2 // 2          # ~0.5s of s16 mono
+                n_batches = 0
+                t_first = None
+
+                async def ship(frames, last: bool) -> None:
+                    nonlocal sent_partial, n_batches
+                    if not frames:
+                        return
+                    payload = opus_frames_to_tcp_payload(frames)
+                    mic_timeout = (dev_cfg["default_mic_timeout"]
+                                   if (is_final and last) else 0)
+                    await send_audio(device.ip, tcp_port, payload,
+                                     mic_timeout=mic_timeout,
+                                     volume=dev_cfg["default_volume"],
+                                     fade=dev_cfg["led_fade"])
+                    n_batches += 1
+                    if not (is_final and last):
+                        sent_partial = True
+
                 try:
-                    pcm = await tts.synthesize(sentence, device.voice, config)
+                    async for pcm in tts.synthesize_stream(
+                            sentence, device.voice, config):
+                        if device.interrupted.is_set():
+                            log.info(f"Interrupted mid-stream "
+                                     f"({n_batches} batches sent)")
+                            return False
+                        if t_first is None:
+                            t_first = time.monotonic() - turn_t0
+                        batch_pcm += pcm
+                        if len(batch_pcm) >= batch_min:
+                            await ship(enc.encode_chunk(batch_pcm), last=False)
+                            batch_pcm = b""
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
                     return False
+
                 if device.interrupted.is_set():
-                    log.info(f"Interrupted before send")
+                    log.info(f"Interrupted before final send")
                     return False
-                frames = opus_encode(pcm, sample_rate, opus_frame_size)
-                payload = opus_frames_to_tcp_payload(frames)
-                mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
+                frames = enc.encode_chunk(batch_pcm) + enc.flush()
                 log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
-                         f"{len(frames)} opus frames to {device.ip} "
+                         f"tts_first[+{t_first:.2f}s] {n_batches + 1} batches "
+                         f"to {device.ip} "
                          f"({'final' if is_final else 'partial'}: {sentence!r})")
-                await send_audio(device.ip, tcp_port, payload,
-                                 mic_timeout=mic_timeout,
-                                 volume=dev_cfg["default_volume"],
-                                 fade=dev_cfg["led_fade"])
-                if not is_final:
-                    sent_partial = True
+                await ship(frames, last=True)
                 return True
+
+
 
             async def reopen_mic_if_needed():
                 """If we already sent partial audio with mic_timeout=0, the mic

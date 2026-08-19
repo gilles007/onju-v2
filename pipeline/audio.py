@@ -74,6 +74,36 @@ def opus_encode(pcm_data: bytes, sample_rate: int = 16000, frame_size: int = 320
     return frames
 
 
+
+class OpusStreamEncoder:
+    """Stateful Opus encoder for chunked PCM: keeps codec state across chunks,
+    carries partial frames between calls, pads only at flush (sentence end)."""
+
+    def __init__(self, sample_rate: int = 16000, frame_size: int = 320):
+        self.encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
+        self.frame_size = frame_size
+        self.frame_bytes = frame_size * 2
+        self.carry = b""
+
+    def encode_chunk(self, pcm_data: bytes) -> list[bytes]:
+        data = self.carry + pcm_data
+        frames = []
+        n_full = len(data) // self.frame_bytes
+        for i in range(n_full):
+            frame = data[i * self.frame_bytes:(i + 1) * self.frame_bytes]
+            frames.append(self.encoder.encode(frame, self.frame_size))
+        self.carry = data[n_full * self.frame_bytes:]
+        return frames
+
+    def flush(self) -> list[bytes]:
+        if not self.carry:
+            return []
+        chunk = self.carry + b"\x00" * (self.frame_bytes - len(self.carry))
+        self.carry = b""
+        return [self.encoder.encode(chunk, self.frame_size)]
+
+
+
 def opus_frames_to_tcp_payload(opus_frames: list[bytes]) -> bytes:
     parts = []
     for frame in opus_frames:
