@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import audioop
 
 import httpx
 from pydub import AudioSegment
@@ -16,6 +17,69 @@ async def synthesize(text: str, voice: str, config: dict) -> bytes:
     if backend == "local":
         return await _local(text, config)
     raise ValueError(f"Unknown TTS backend: {backend}")
+
+
+
+async def synthesize_stream(text: str, voice: str, config: dict):
+    """Async generator yielding pipeline-rate (16k) mono s16le PCM chunks.
+
+    backend != 'local_stream': one chunk — the whole sentence via synthesize(),
+    byte-identical to today's behavior (Kokoro path untouched).
+    backend 'local_stream': chunked WAV from a dual-mode server (qwen3-tts-fast);
+    header parsed off the stream, stateful resample fallback if the server's rate
+    differs from the pipeline rate.
+    """
+    backend = config["tts"]["backend"]
+    if backend != "local_stream":
+        yield await synthesize(text, voice, config)
+        return
+
+    cfg = config["tts"]["local_stream"]
+    url = cfg["url"].rstrip("/") + "/v1/audio/speech"
+    target_rate = config["audio"]["sample_rate"]
+    payload = {
+        "model": cfg.get("model", "qwen3-tts-fast"),
+        "input": text,
+        "voice": voice or cfg.get("voice", ""),
+        "voice": cfg.get("voice", "") or voice or "default",
+        "response_format": "wav",
+        "stream": True,
+        "sampling_rate": target_rate,
+        "temperature": cfg.get("temperature", 0.1),
+        "top_k": cfg.get("top_k", 1),
+        "do_sample": cfg.get("do_sample", False),
+    }
+
+    header = b""
+    src_rate = None
+    ratecv_state = None
+    stub = b""
+
+    async with httpx.AsyncClient(timeout=cfg.get("timeout", 60)) as client:
+        async with client.stream("POST", url, json=payload) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes():
+                if src_rate is None:
+                    header += chunk
+                    if len(header) < 44:
+                        continue
+                    src_rate = int.from_bytes(header[24:28], "little")
+                    if src_rate != target_rate:
+                        log.warning(f"TTS stream at {src_rate}Hz, resampling to {target_rate}")
+                    chunk = header[44:]
+                    if not chunk:
+                        continue
+                pcm = stub + chunk
+                if len(pcm) % 2:
+                    pcm, stub = pcm[:-1], pcm[-1:]
+                else:
+                    stub = b""
+                if not pcm:
+                    continue
+                if src_rate != target_rate:
+                    pcm, ratecv_state = audioop.ratecv(
+                        pcm, 2, 1, src_rate, target_rate, ratecv_state)
+                yield pcm
 
 
 async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
