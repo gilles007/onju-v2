@@ -267,6 +267,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 batch_min = sample_rate * 2 // 2          # ~0.5s of s16 mono
                 n_batches = 0
                 t_first = None
+                _debug_pcm = b"";
 
                 async def ship(frames, last: bool) -> None:
                     nonlocal sent_partial, n_batches
@@ -293,12 +294,29 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         if t_first is None:
                             t_first = time.monotonic() - turn_t0
                         batch_pcm += pcm
+                        _debug_pcm += pcm;
                         if len(batch_pcm) >= batch_min:
                             await ship(enc.encode_chunk(batch_pcm), last=False)
                             batch_pcm = b""
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
                     return False
+
+
+                ####  DEBUG:  Log TTS Wav output to temp debug files
+                import pathlib, wave as _wave
+                _dbg_dir = pathlib.Path("/tmp/tts-debug")
+                _dbg_dir.mkdir(exist_ok=True)
+                _dbg_path = _dbg_dir / f"{int(time.time())}_{sentence[:20].replace(' ','_')}.wav"
+                with _wave.open(str(_dbg_path), "wb") as _w:
+                    _w.setnchannels(1); _w.setsampwidth(2)
+                    _w.setframerate(config["audio"]["sample_rate"])
+                    _w.writeframes(_debug_pcm)
+                log.info(f"DEBUG  saved {len(_debug_pcm)}B -> {_dbg_path}")
+
+
+
+
 
                 if device.interrupted.is_set():
                     log.info(f"Interrupted before final send")
