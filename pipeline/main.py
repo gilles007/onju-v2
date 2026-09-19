@@ -295,9 +295,9 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                             t_first = time.monotonic() - turn_t0
                         batch_pcm += pcm
                         _debug_pcm += pcm;
-                        if len(batch_pcm) >= batch_min:
-                            await ship(enc.encode_chunk(batch_pcm), last=False)
-                            batch_pcm = b""
+#                        if len(batch_pcm) >= batch_min:
+#                            await ship(enc.encode_chunk(batch_pcm), last=False)
+#                            batch_pcm = b""
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
                     return False
