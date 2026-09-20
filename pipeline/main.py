@@ -268,6 +268,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 n_frames = 0
                 t_first = None
                 _dbg_pcm = b""
+                max_audio_bytes = config["audio"]["sample_rate"] * 2 * 30  # 30s hard cap
 
                 mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
                 writer = await open_audio_connection(
@@ -289,6 +290,10 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         if t_first is None:
                             t_first = time.monotonic() - turn_t0
                         _dbg_pcm += pcm
+                        # Detect possible TTS hallucination, and stop it before it becomes extremely long babble
+                        if (len(_dbg_pcm) > max_audio_bytes:
+                            log.warning(f"TTS runaway detected (audio len exceeds longest expected utterance)");
+                            break;
                         batch_pcm += pcm
                         if len(batch_pcm) >= batch_min:
                             frames = enc.encode_chunk(batch_pcm)
