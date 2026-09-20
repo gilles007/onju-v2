@@ -14,8 +14,9 @@ async def synthesize(text: str, voice: str, config: dict) -> bytes:
     backend = config["tts"]["backend"]
     if backend == "elevenlabs":
         return await _elevenlabs(text, voice, config)
-    if backend == "local":
-        return await _local(text, config)
+    if backend in ("local", "local_stream"):
+        cfg = config["tts"].get(backend, config["tts"].get("local", {}))
+        return await _local(text, config, cfg_override=cfg)
     raise ValueError(f"Unknown TTS backend: {backend}")
 
 
@@ -106,7 +107,7 @@ async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
 
 
 async def _local(text: str, config: dict) -> bytes:
-    local_cfg = config["tts"]["local"]
+    local_cfg = cfg_override or config["tts"]["local"]
     url = local_cfg["url"].rstrip("/") + "/v1/audio/speech"
 
     payload = {
