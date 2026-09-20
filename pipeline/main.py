@@ -16,7 +16,7 @@ from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload,
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import send_audio, send_led_blink, open_led_connection, write_led_blink, close_led_connection
+from pipeline.protocol import send_audio, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
@@ -252,11 +252,11 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             stream_start_at: float | None = None
 
 
+
             async def send_sentence(sentence: str, is_final: bool) -> bool:
-                """Synthesize, encode, and push one sentence — streamed in
-                batches as TTS produces audio. Returns True on success, False
-                if interrupted or TTS failed. Non-streaming backends yield one
-                batch, reproducing the previous behavior exactly."""
+                """Synthesize, encode, and stream one sentence over a single
+                TCP connection. Opus frames are written as the TTS produces
+                audio; closing the connection signals end-of-segment to the pod."""
                 nonlocal sent_partial
                 if device.interrupted.is_set():
                     log.info(f"Interrupted before TTS")
@@ -265,45 +265,60 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 enc = OpusStreamEncoder(sample_rate, opus_frame_size)
                 batch_pcm = b""
                 batch_min = sample_rate * 2 // 2          # ~0.5s of s16 mono
-                n_batches = 0
+                n_frames = 0
                 t_first = None
-                _debug_pcm = b"";
+                _dbg_pcm = b""
 
-                async def ship(frames, last: bool) -> None:
-                    nonlocal sent_partial, n_batches
-                    if not frames:
-                        return
-                    payload = opus_frames_to_tcp_payload(frames)
-                    mic_timeout = (dev_cfg["default_mic_timeout"]
-                                   if (is_final and last) else 0)
-                    await send_audio(device.ip, tcp_port, payload,
-                                     mic_timeout=mic_timeout,
-                                     volume=dev_cfg["default_volume"],
-                                     fade=dev_cfg["led_fade"])
-                    n_batches += 1
-                    if not (is_final and last):
-                        sent_partial = True
+                mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
+                writer = await open_audio_connection(
+                    device.ip, tcp_port,
+                    mic_timeout=mic_timeout,
+                    volume=dev_cfg["default_volume"],
+                    fade=dev_cfg["led_fade"])
+                if writer is None:
+                    log.error(f"Failed to open audio connection to {device.ip}")
+                    return False
 
                 try:
                     async for pcm in tts.synthesize_stream(
                             sentence, device.voice, config):
                         if device.interrupted.is_set():
                             log.info(f"Interrupted mid-stream "
-                                     f"({n_batches} batches sent)")
+                                     f"({n_frames} frames sent)")
                             return False
                         if t_first is None:
                             t_first = time.monotonic() - turn_t0
+                        _dbg_pcm += pcm
                         batch_pcm += pcm
-                        _debug_pcm += pcm;
-#                        if len(batch_pcm) >= batch_min:
-#                            await ship(enc.encode_chunk(batch_pcm), last=False)
-#                            batch_pcm = b""
+                        if len(batch_pcm) >= batch_min:
+                            frames = enc.encode_chunk(batch_pcm)
+                            if frames and not write_audio_frames(writer, frames):
+                                log.error(f"Connection lost mid-stream to {device.ip}")
+                                return False
+                            await writer.drain()
+                            n_frames += len(frames)
+                            batch_pcm = b""
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
                     return False
+                finally:
+                    # Always close — even on error/interrupt, so the pod
+                    # gets EOF and doesn't hang waiting for more frames.
+                    tail = enc.encode_chunk(batch_pcm) + enc.flush()
+                    if tail:
+                        write_audio_frames(writer, tail)
+                        n_frames += len(tail)
+                    await close_audio_connection(writer)
 
+                if not is_final:
+                    sent_partial = True
 
-                ####  DEBUG:  Log TTS Wav output to temp debug files
+                log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
+                         f"tts_first[+{t_first:.2f}s] {n_frames} frames "
+                         f"to {device.ip} "
+                         f"({'final' if is_final else 'partial'}: {sentence!r})")
+
+                # Debug dump
                 import pathlib, wave as _wave
                 _dbg_dir = pathlib.Path("/tmp/tts-debug")
                 _dbg_dir.mkdir(exist_ok=True)
@@ -311,22 +326,9 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 with _wave.open(str(_dbg_path), "wb") as _w:
                     _w.setnchannels(1); _w.setsampwidth(2)
                     _w.setframerate(config["audio"]["sample_rate"])
-                    _w.writeframes(_debug_pcm)
-                log.info(f"DEBUG  saved {len(_debug_pcm)}B -> {_dbg_path}")
+                    _w.writeframes(_dbg_pcm)
+                log.info(f"DEBUG  saved {len(_dbg_pcm)}B -> {_dbg_path}")
 
-
-
-
-
-                if device.interrupted.is_set():
-                    log.info(f"Interrupted before final send")
-                    return False
-                frames = enc.encode_chunk(batch_pcm) + enc.flush()
-                log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
-                         f"tts_first[+{t_first:.2f}s] {n_batches + 1} batches "
-                         f"to {device.ip} "
-                         f"({'final' if is_final else 'partial'}: {sentence!r})")
-                await ship(frames, last=True)
                 return True
 
 

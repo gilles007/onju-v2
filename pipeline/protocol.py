@@ -37,6 +37,60 @@ async def send_audio(ip: str, port: int, opus_payload: bytes, mic_timeout: int =
     await send_tcp(ip, port, header, opus_payload)
 
 
+
+# FIX 20261019
+# Keep connection open until the entire sentence is sent (to prevent chopped audio)
+#
+async def open_audio_connection(ip: str, port: int, mic_timeout: int = 60,
+                                 volume: int = 14, fade: int = 6,
+                                 timeout: float = 5) -> asyncio.StreamWriter | None:
+    """Open a persistent TCP connection and send the audio header.
+    Returns the writer for incremental frame writes, or None on failure."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        header = bytes([
+            0xAA,
+            (mic_timeout >> 8) & 0xFF,
+            mic_timeout & 0xFF,
+            volume,
+            fade,
+            2,  # Opus
+        ])
+        writer.write(header)
+        await writer.drain()
+        return writer
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        return None
+
+
+def write_audio_frames(writer: asyncio.StreamWriter, opus_frames: list[bytes]) -> bool:
+    """Write length-prefixed Opus frames to an open audio connection.
+    Returns False if the connection is dead."""
+    try:
+        for frame in opus_frames:
+            writer.write(struct.pack('>H', len(frame)))
+            writer.write(frame)
+        return True
+    except (ConnectionError, OSError):
+        return False
+
+
+async def close_audio_connection(writer: asyncio.StreamWriter):
+    """Flush and close — EOF tells the pod this audio segment is done."""
+    try:
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
+#
+# End of Fix 20261019
+
+
+
+
 async def send_led_blink(ip: str, port: int, intensity: int, r: int = 255, g: int = 255, b: int = 255, fade: int = 6):
     # header[0]   0xCC for LED blink
     # header[1]   starting intensity
