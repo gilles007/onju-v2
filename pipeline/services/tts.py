@@ -106,7 +106,7 @@ async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
     return audio.raw_data
 
 
-async def _local(text: str, config: dict) -> bytes:
+async def _local(text: str, config: dict, cfg_override=None) -> bytes:
     local_cfg = cfg_override or config["tts"]["local"]
     url = local_cfg["url"].rstrip("/") + "/v1/audio/speech"
 
