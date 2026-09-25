@@ -3,6 +3,7 @@ asr:
 
 conversation:
   backend: "agentic"                           # "agentic" (e.g. OpenClaw, with tools) or "conversational" (plain chat)
+  pause_flush_s: 0.8                           # play a held sentence if the agent's text pauses this long (0 = wait for the next sentence)
 
   stall:
     enabled: true                              # decide if a stall phrase is needed while the agent works

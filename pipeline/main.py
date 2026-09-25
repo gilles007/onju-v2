@@ -380,12 +380,71 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     f"don't repeat this phrase, continue naturally with the answer.)"
                 )
 
+            # Pause flush (2026-09-25, Ruby): normally each sentence is held as
+            # `pending` until the NEXT one arrives (lookahead), so we know which
+            # sentence is the last one and can send it as final. But when the
+            # agent says a progress line ("Let me look that up.") and then goes
+            # quiet for 30+ s while it works, that line would stay silent until
+            # the answer arrives. Now, if no new sentence arrives within
+            # conversation.pause_flush_s seconds (default 0.8; 0 disables),
+            # the held sentence is played right away as non-final. When
+            # sentences arrive quickly nothing changes.
+            #
+            # To wait with a timeout without killing the text stream, a
+            # producer task iterates sentence_chunks() and feeds a queue; the
+            # loop below waits on the queue. (asyncio.wait_for directly on the
+            # generator's __anext__ would cancel and close the generator on
+            # timeout.) Stream errors are handed over through the queue and
+            # re-raised here, so the "LLM failed" path below still applies.
+            pause_flush_s = float(config["conversation"].get("pause_flush_s", 0.8) or 0)
+            sentence_q: asyncio.Queue = asyncio.Queue()
+            _STREAM_END = object()   # sentinel: the text stream finished
+
+            async def produce_sentences():
+                try:
+                    async for s in sentence_chunks(
+                        device.conversation.stream(text, extra_context=extra_context)
+                    ):
+                        await sentence_q.put(s)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    await sentence_q.put(e)   # re-raised by the consumer
+                    return
+                await sentence_q.put(_STREAM_END)
+
+            producer: asyncio.Task | None = None
+            flushed_on_pause = 0   # sentences played early because the stream paused
+
             aborted = False
             try:
                 stream_start_at = time.monotonic()
-                async for sentence in sentence_chunks(
-                    device.conversation.stream(text, extra_context=extra_context)
-                ):
+                producer = asyncio.create_task(produce_sentences())
+                while True:
+                    if pending is not None and pause_flush_s > 0:
+                        try:
+                            item = await asyncio.wait_for(sentence_q.get(), pause_flush_s)
+                        except asyncio.TimeoutError:
+                            # The text stream paused with a sentence held: play
+                            # it now as non-final (mic stays closed, the turn
+                            # goes on). The stall audio was already awaited
+                            # before `pending` was set.
+                            log.info(f"LLM  stream paused {pause_flush_s:.1f}s, "
+                                     f"playing held sentence now")
+                            if not await send_sentence(pending, is_final=False):
+                                aborted = True
+                                break
+                            pending = None
+                            flushed_on_pause += 1
+                            continue
+                    else:
+                        item = await sentence_q.get()
+                    if item is _STREAM_END:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item   # stream error from the producer
+                    sentence = item
+
                     full_response.append(sentence)
                     if first_sentence_at is None:
                         first_sentence_at = time.monotonic()
@@ -418,6 +477,15 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         pass
                 await reopen_mic_if_needed()
                 continue
+            finally:
+                # Abort, interruption (send_sentence returned False) or error:
+                # stop reading the text stream. No-op when it already ended.
+                if producer is not None and not producer.done():
+                    producer.cancel()
+                    try:
+                        await producer
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             # Drain the stall task if it's still pending (e.g. LLM stream
             # returned zero content).
@@ -438,6 +506,9 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     continue
             elif sent_partial:
                 # The stall played but OpenClaw returned nothing — reopen mic.
+                # Also the pause-flush case: the last sentence already played
+                # as non-final (mic_timeout=0) during a pause, so close the
+                # turn the same way: an empty send with the default timeout.
                 if not device.ptt:
                     await send_audio(device.ip, tcp_port, b"",
                                      mic_timeout=dev_cfg["default_mic_timeout"],
@@ -455,7 +526,8 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             elapsed = time.monotonic() - turn_t0
             ttfs = f"{first_sentence_at - turn_t0:.2f}s" if first_sentence_at else "—"
             log.info(f"LLM  [{ttfs} first / {elapsed:.2f}s total / "
-                     f"{len(full_response)} sentences / {len(response_text)} chars] "
+                     f"{len(full_response)} sentences / {len(response_text)} chars"
+                     f"{f' / {flushed_on_pause} played on pause' if flushed_on_pause else ''}] "
                      f"{response_text}")
 
         except Exception as e:
