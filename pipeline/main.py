@@ -297,7 +297,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         batch_pcm += pcm
                         ### 20261124, I'm still getting TTS Hallucination (due to short sentences?)
                         ### Comment 7 lines below to send one sentence at a time? (I don't think it's networks stack related, but try)
-                        #if len(batch_pcm) >= batch_min:
+                        if len(batch_pcm) >= batch_min:
                             frames = enc.encode_chunk(batch_pcm)
                             if frames and not write_audio_frames(writer, frames):
                                 log.error(f"Connection lost mid-stream to {device.ip}")
