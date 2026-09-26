@@ -124,6 +124,10 @@ vad:
   neg_threshold: 0.35                        # speech offset probability (hysteresis)
   silence_time: 1.5
   pre_buffer_s: 1.0
+  # VOX barge-in (talking over the reply to interrupt it). PTT pods always
+  # interrupt on a button press, these don't apply to them.
+  interrupt_min_ms: 300                      # continuous speech needed to interrupt (0 = first frame over threshold)
+  interrupt_only_while_playing: true         # only while the pod plays the reply, not while waiting for ASR / the agent
 
 network:
   udp_port: 3000

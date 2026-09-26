@@ -215,7 +215,7 @@ See [`pipeline/config.yaml.example`](pipeline/config.yaml.example) for all optio
 | `conversation.agentic` | OpenClaw gateway URL, auth token, message channel |
 | `conversation.stall` | Fast classifier that decides if the agentic backend needs a brief spoken stall |
 | `tts` | TTS backend (`"elevenlabs"` or `"local"`), voice settings |
-| `vad` | Voice activity detection thresholds and timing |
+| `vad` | Voice activity detection thresholds and timing; when speech may interrupt a reply on VOX pods (`interrupt_min_ms`, `interrupt_only_while_playing`) |
 | `network` | UDP/TCP/multicast ports |
 | `device` | Volume, mic timeout, LED settings, greeting audio |
 
@@ -249,6 +249,11 @@ python tests/test_stall.py
 # Inspect raw SSE chunk shapes from the configured agentic gateway
 python tests/test_stream.py
 python tests/test_stream.py "your prompt here"
+
+# Offline checks (localhost only, no hardware): pause flush, LED states, VOX barge-in
+python tests/test_pause_flush.py
+python tests/test_led_state.py
+python tests/test_vox_interrupt.py
 
 # Serial monitor (auto-detects USB port)
 python serial_monitor.py
