@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 import numpy as np
 import yaml
 
+from pipeline import bargein
 from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, OpusStreamEncoder
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
@@ -143,10 +144,16 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
             # VOX: run VAD
             utterance = device.vad.process_frame(pcm)
 
-            # Interrupt only on actual speech (not background noise)
+            # Barge-in (2026-09-26): speech interrupts the turn only once it
+            # has lasted vad.interrupt_min_ms (default 300 ms), and by default
+            # only while the pod is playing the reply, not while we wait for
+            # ASR or the agent. Interrupts and ignored speech are logged.
+            # See pipeline/bargein.py.
             if device.processing:
-                if device.vad.speech_prob > config["vad"]["threshold"]:
-                    device.interrupted.set()
+                if not device.interrupted.is_set():
+                    if bargein.for_device(device, config).on_frame(
+                            device.vad.speech_prob, len(pcm) / sample_rate):
+                        device.interrupted.set()
                 continue
 
             # Track VAD recording transitions for persistent LED TCP
@@ -244,6 +251,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
         device.processing = True
         device.interrupted.clear()
+        bargein.for_device(device, config).new_turn()
 
         try:
             # Safety: close any lingering LED connection before processing
@@ -327,6 +335,14 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     log.error(f"Failed to open audio connection to {device.ip}")
                     return False
 
+                # Playback estimate for VOX barge-in: this sentence starts
+                # playing when the previous one has finished (or now), and
+                # lasts as long as the audio sent so far (+ a margin, see
+                # pipeline/bargein.py). Updated after every batch of frames.
+                barge = bargein.for_device(device, config)
+                seg_start = barge.start_segment()
+                frame_s = opus_frame_size / sample_rate
+
                 try:
                     async for pcm in tts.synthesize_stream(
                             sentence, device.voice, config):
@@ -351,6 +367,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                                 return False
                             await writer.drain()
                             n_frames += len(frames)
+                            barge.audio_sent(seg_start, n_frames * frame_s)
                             batch_pcm = b""
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
@@ -363,6 +380,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         write_audio_frames(writer, tail)
                         n_frames += len(tail)
                     await close_audio_connection(writer)
+                    barge.audio_sent(seg_start, n_frames * frame_s)
 
                 if not is_final:
                     sent_partial = True
