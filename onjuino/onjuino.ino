@@ -1,3 +1,10 @@
+#include <opus_custom.h>
+#include <opus_defines.h>
+#include <opus.h>
+#include <opus_multistream.h>
+#include <opus_projection.h>
+#include <opus_types.h>
+
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>
@@ -6,6 +13,29 @@
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <opus.h>
+
+
+#define  WIFI_DEBUG_LEVEL  1
+
+#define  TARGET_GROKBOT    1
+
+#ifdef  TARGET_HERMES
+#define  PORT_UDP_MIC     3000
+#define  PORT_MULTICAST   12345
+#define  ADDR_MULTICAST   IPAddress(239, 0, 0, 1)
+
+#elifdef TARGET_GROKBOT
+#define  PORT_UDP_MIC     3100
+#define  PORT_MULTICAST   12346
+#define  ADDR_MULTICAST   IPAddress(239, 0, 0, 2)
+
+#else
+#error "You must define either TARGET_HERMES or TARGET_GROKBOT"
+#endif
+#define  PORT_TCP_MESSAGING  3001
+
+
+
 
 #if __has_include("git_hash.h") // optionally setup post-commit hook to generate git_hash.h
 #include "git_hash.h"
@@ -46,11 +76,11 @@ Adafruit_NeoPixel leds(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // UDP Settings
 IPAddress serverIP(0, 0, 0, 0); // Placeholder until we get first TCP client greeting us
-unsigned int udpPort = 3000;
+unsigned int udpPort = PORT_UDP_MIC;
 WiFiUDP udp;
 
 // TCP Settings
-WiFiServer tcpServer(3001);
+WiFiServer tcpServer(PORT_TCP_MESSAGING);
 
 volatile bool isPlaying = false;
 uint32_t mic_timeout = 0;
@@ -87,6 +117,12 @@ uint8_t gammaCorrectionTable[256];
 // Speaker buffer settings
 const size_t tcpBufferSize = 512; // for received audio data before processing into 32-bit chunks for MAX98357A
 uint8_t tcpBuffer[tcpBufferSize];
+
+// 20260819 LED Thinking Animation add-on - Device visual state
+enum DeviceVisualState { VS_IDLE, VS_LISTENING, VS_THINKING, VS_SPEAKING };
+volatile DeviceVisualState visualState = VS_IDLE;
+volatile uint32_t thinkingStartMs = 0;
+
 
 int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playback from TCP
 
@@ -142,6 +178,44 @@ i2s_pin_config_t pin_config = {
     .ws_io_num = I2S_WS_PIN,
     .data_out_num = I2S_OUT,
     .data_in_num = I2S_IN};
+
+
+
+#if (WIFI_DEBUG_LEVEL > 1)
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.printf("[WiFi] evt %d: ", event);
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_START:
+      Serial.println("STA_START");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.printf("ASSOCIATED ssid=%s ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X\n",
+        info.wifi_sta_connected.ssid, info.wifi_sta_connected.channel,
+        info.wifi_sta_connected.bssid[0], info.wifi_sta_connected.bssid[1],
+        info.wifi_sta_connected.bssid[2], info.wifi_sta_connected.bssid[3],
+        info.wifi_sta_connected.bssid[4], info.wifi_sta_connected.bssid[5]);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("DISCONNECTED reason=%d\n", info.wifi_sta_disconnected.reason);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("GOT_IP (DHCP done): %s gw=%s\n",
+        IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str(),
+        IPAddress(info.got_ip.ip_info.gw.addr).toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      Serial.println("LOST_IP");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE:
+      Serial.println("AUTHMODE_CHANGE");
+      break;
+    default:
+      Serial.println("(other)");
+      break;
+  }
+}
+#endif
+
 
 void setup()
 {
@@ -228,6 +302,24 @@ void setup()
 
     loadConfig();
 
+#if WIFI_DEBUG_LEVEL > 1
+    WiFi.onEvent(onWiFiEvent);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);   // rules out modem-sleep flakiness during connect    
+#endif
+
+#if WIFI_DEBUG_LEVEL
+    Serial.println("[WiFi] scanning...");
+    int n = WiFi.scanNetworks();
+    Serial.printf("[WiFi] %d networks found\n", n);
+    for (int i = 0; i < n; i++) {
+      Serial.printf("  %2d: %-32s  %4d dBm  ch %2d  %s\n",
+        i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+        WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "ENC");
+    }
+    WiFi.scanDelete();
+#endif
+
     WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
 
     Serial.print("Connecting to WiFi");
@@ -298,7 +390,7 @@ void setup()
     }
 
     Serial.println("Sending multicast packet to announce presence");
-    udp.beginPacket(IPAddress(239, 0, 0, 1), 12345);
+    udp.beginPacket(ADDR_MULTICAST, PORT_MULTICAST);
     String mcast_string = String(hostname) + " " + String(GIT_HASH);
     if (PTT_MODE) mcast_string += " PTT";
     udp.write(reinterpret_cast<const uint8_t *>(mcast_string.c_str()), mcast_string.length());
@@ -394,7 +486,7 @@ void loop()
         case 'A':
         {
             Serial.println("[UART] Sending multicast announcement");
-            udp.beginPacket(IPAddress(239, 0, 0, 1), 12345);
+            udp.beginPacket(ADDR_MULTICAST, PORT_MULTICAST);
             String mcast_string = String(WiFi.getHostname()) + " " + String(GIT_HASH);
             if (PTT_MODE) mcast_string += " PTT";
             udp.write(reinterpret_cast<const uint8_t *>(mcast_string.c_str()), mcast_string.length());
@@ -489,6 +581,9 @@ void loop()
             */
             if (header[0] == 0xAA)
             {
+                // 20260819 LED Animation - Update state
+                visualState = VS_SPEAKING;
+
                 if (!deviceEnabled)
                 {
                     Serial.println("Ignoring audio - device disabled");
@@ -662,6 +757,10 @@ void loop()
 
                 isPlaying = false;
 
+                // 20260819 LED Animation - Update state
+                visualState = VS_IDLE;
+
+
                 if (!PTT_MODE && deviceEnabled) {
                     uint32_t timeout_ms = max((uint32_t)(timeout * 1000), (uint32_t)MIC_LISTEN_MS);
                     mic_timeout = millis() + timeout_ms;
@@ -726,6 +825,22 @@ void loop()
                 uint16_t timeout = header[1] << 8 | header[2];
                 mic_timeout = millis() + (uint32_t)timeout * 1000;
             }
+
+            // 20260819 LED Thinking Animation add-on - Device visual state
+            else if (header[0] == 0xEE)
+            {
+                // State change command: header[1] = state enum
+                // 0=idle, 1=listening, 2=thinking, 3=speaking
+                uint8_t newState = header[1];
+                Serial.printf("Received state command (0xEE): %d\n", newState);
+                switch (newState) {
+                    case 0: visualState = VS_IDLE; break;
+                    case 1: visualState = VS_LISTENING; break;
+                    case 2: visualState = VS_THINKING; thinkingStartMs = millis(); break;
+                    case 3: visualState = VS_SPEAKING; break;
+                }
+            }
+
             else
             {
                 Serial.println("Received unknown command");
@@ -1002,7 +1117,27 @@ void updateLedTask(void *parameter)
     while (1)
     {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
-        if (ledLevel > 0)
+
+        // 20260819 LED Thinking Animation add-on
+        if (visualState == VS_THINKING)
+        {
+            // Smooth chase: a bright dot orbits LEDs 1-4 with a trailing fade
+            uint32_t elapsed = millis() - thinkingStartMs;
+            float pos = fmodf((float)elapsed / 400.0f, 4.0f);  // one orbit per 1.6s
+
+            for (int i = 1; i < 5; i++)
+            {
+                float dist = fmodf(fabsf((float)(i - 1) - pos) + 4.0f, 4.0f);
+                if (dist > 2.0f) dist = 4.0f - dist;  // wrap-around distance
+                float brightness = fmaxf(0.0f, 1.0f - dist * 0.6f);
+                uint8_t level = gammaCorrectionTable[(uint8_t)(brightness * 200.0f)];
+                // Teal chase — match Vesper's color identity
+                leds.setPixelColor(i, 0, level, level * 180 / 255);
+            }
+            leds.show();
+        }
+
+        else if (ledLevel > 0)
         {
             if (ledLevel > ledFade)
             {

@@ -90,6 +90,12 @@ async def close_audio_connection(writer: asyncio.StreamWriter):
 
 
 
+# 20260819 LED Thinking Animation add-on
+async def send_state(ip: str, port: int, state: int, timeout: float = 1):
+    """Send visual state command. 0=idle, 1=listening, 2=thinking, 3=speaking."""
+    header = bytes([0xEE, state, 0, 0, 0, 0])
+    await send_tcp(ip, port, header, timeout=timeout)
+
 
 async def send_led_blink(ip: str, port: int, intensity: int, r: int = 255, g: int = 255, b: int = 255, fade: int = 6):
     # header[0]   0xCC for LED blink

@@ -416,6 +416,11 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             producer: asyncio.Task | None = None
             flushed_on_pause = 0   # sentences played early because the stream paused
 
+
+
+            # 20260819 Send state to client (for LED Thinking Animation)
+            await send_state(device.ip, tcp_port, 2)  # 2 = thinking            
+
             aborted = False
             try:
                 stream_start_at = time.monotonic()
