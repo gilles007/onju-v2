@@ -91,8 +91,23 @@ async def close_audio_connection(writer: asyncio.StreamWriter):
 
 
 # 20260819 LED Thinking Animation add-on
-async def send_state(ip: str, port: int, state: int, timeout: float = 1):
-    """Send visual state command. 0=idle, 1=listening, 2=thinking, 3=speaking."""
+# Values for header[1] of the 0xEE state command. Must match
+# DeviceVisualState in onjuino/onjuino.ino.
+STATE_IDLE = 0
+STATE_LISTENING = 1
+STATE_THINKING = 2
+STATE_SPEAKING = 3
+
+
+async def send_state(ip: str, port: int, state: int, timeout: float = 0.2):
+    """Send visual state command. 0=idle, 1=listening, 2=thinking, 3=speaking.
+
+    Uses its own short TCP connection. The pod only accepts a new connection
+    between playbacks, so a state sent while audio is playing is queued by
+    the pod's TCP stack and applied right after that playback ends."""
+    # header[0]   0xEE for visual state
+    # header[1]   state (see STATE_* above)
+    # header[2:5] not used
     header = bytes([0xEE, state, 0, 0, 0, 0])
     await send_tcp(ip, port, header, timeout=timeout)
 

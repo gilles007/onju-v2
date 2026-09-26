@@ -16,10 +16,46 @@ from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload,
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection
+from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
+
+
+# LED status (0xEE state command, 2026-09-25). The pod shows a THINKING
+# chase from the moment the user stops talking until the answer plays.
+# State sends never block a turn: each one is a background task with a
+# short timeout whose errors are only logged at debug level. Sends to the
+# same pod are chained so they reach it in the order they were issued
+# (a quick turn's final IDLE can't overtake its own THINKING).
+STATE_TIMEOUT_S = 0.2
+_state_tasks: set[asyncio.Task] = set()        # strong refs so tasks aren't GC'd
+_state_tail: dict[str, asyncio.Task] = {}      # last state task per pod IP
+
+
+async def _send_state_after(prev: asyncio.Task | None, ip: str, port: int, state: int):
+    if prev is not None and not prev.done():
+        await asyncio.wait({prev})   # wait for it without cancelling it
+    try:
+        # send_tcp's timeout only covers connect; also bound write/close.
+        await asyncio.wait_for(send_state(ip, port, state, timeout=STATE_TIMEOUT_S),
+                               STATE_TIMEOUT_S + 0.3)
+    except Exception as e:
+        log.debug(f"STATE {state} to {ip} failed: {e!r}")
+
+
+def fire_state(ip: str, port: int, state: int) -> asyncio.Task:
+    """Send a 0xEE state to the pod in the background (fire-and-forget)."""
+    task = asyncio.create_task(_send_state_after(_state_tail.get(ip), ip, port, state))
+    _state_tasks.add(task)
+    _state_tail[ip] = task
+
+    def _done(t: asyncio.Task):
+        _state_tasks.discard(t)
+        if _state_tail.get(ip) is t:
+            del _state_tail[ip]
+    task.add_done_callback(_done)
+    return task
 
 
 def load_config(path: str = None) -> dict:
@@ -215,6 +251,16 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 await close_led_connection(device.vad_writer)
                 device.vad_writer = None
 
+            # LED THINKING starts here. udp_listener queued this utterance the
+            # moment it decided the user stopped talking (VAD end of speech,
+            # VAD packet timeout on VOX, or button release on PTT); this is
+            # where it is taken off the queue and handed to ASR, before the
+            # ASR, stall decision and LLM wait. Doing it here rather than in
+            # udp_listener covers all three cases in one place, and it runs
+            # after the previous turn's final IDLE (on a PTT interrupt the
+            # next utterance is queued while the old turn is still ending).
+            fire_state(device.ip, tcp_port, STATE_THINKING)
+
             # ASR
             pcm_bytes = audio_int16.astype(np.int16).tobytes()
             try:
@@ -248,6 +294,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             full_response: list[str] = []
             pending: str | None = None   # sentence waiting to be flushed
             sent_partial = False           # any non-final chunk already sent?
+            answer_sent = False            # any answer (non-stall) sentence sent?
             first_sentence_at: float | None = None
             stream_start_at: float | None = None
 
@@ -375,6 +422,16 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             extra_context: str | None = None
             if stall_text:
                 stall_task = asyncio.create_task(send_sentence(stall_text, is_final=False))
+
+                # The pod drops to IDLE when the stall line finishes playing.
+                # If the answer hasn't started yet, ask for THINKING again; it
+                # queues on the pod and applies right after the stall plays.
+                def _after_stall(t: asyncio.Task):
+                    if t.cancelled() or t.exception() is not None or not t.result():
+                        return   # interrupted or failed: no THINKING
+                    if not answer_sent and not device.interrupted.is_set():
+                        fire_state(device.ip, tcp_port, STATE_THINKING)
+                stall_task.add_done_callback(_after_stall)
                 extra_context = (
                     f"(You already said aloud to the user: \"{stall_text}\" — "
                     f"don't repeat this phrase, continue naturally with the answer.)"
@@ -416,11 +473,6 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             producer: asyncio.Task | None = None
             flushed_on_pause = 0   # sentences played early because the stream paused
 
-
-
-            # 20260819 Send state to client (for LED Thinking Animation)
-            await send_state(device.ip, tcp_port, 2)  # 2 = thinking            
-
             aborted = False
             try:
                 stream_start_at = time.monotonic()
@@ -436,11 +488,15 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                             # before `pending` was set.
                             log.info(f"LLM  stream paused {pause_flush_s:.1f}s, "
                                      f"playing held sentence now")
+                            answer_sent = True
                             if not await send_sentence(pending, is_final=False):
                                 aborted = True
                                 break
                             pending = None
                             flushed_on_pause += 1
+                            # The agent is still working: back to THINKING
+                            # once this sentence has played (queued on the pod).
+                            fire_state(device.ip, tcp_port, STATE_THINKING)
                             continue
                     else:
                         item = await sentence_q.get()
@@ -469,6 +525,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     # Flush the *previous* sentence as non-final; whichever
                     # sentence is last when the stream ends becomes the final.
                     if pending is not None:
+                        answer_sent = True
                         if not await send_sentence(pending, is_final=False):
                             aborted = True
                             break
@@ -506,6 +563,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 continue
 
             if pending is not None:
+                answer_sent = True
                 if not await send_sentence(pending, is_final=True):
                     await reopen_mic_if_needed()
                     continue
@@ -546,6 +604,14 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     pass
         finally:
             device.processing = False
+            # LED: every turn ends in IDLE, whatever path it took (answer,
+            # no speech, interrupt, LLM failure with no stall, PTT with an
+            # empty reply, pipeline error), so THINKING can't get stuck.
+            # Short bounded wait, errors swallowed in fire_state. If the
+            # final answer is still playing, the pod applies this only after
+            # playback ends (it doesn't accept connections while playing),
+            # and playback end already set IDLE, so it can't cut the answer.
+            await asyncio.wait({fire_state(device.ip, tcp_port, STATE_IDLE)}, timeout=1.0)
 
         utterance_queue.task_done()
 
