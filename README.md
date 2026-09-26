@@ -69,6 +69,9 @@ All commands use a 6-byte header. The server initiates TCP connections to the ES
 | `0xBB` | Set LEDs | LED bitmask, RGB color |
 | `0xCC` | LED blink (VAD) | intensity, RGB color, fade rate |
 | `0xDD` | Mic timeout | timeout in seconds (2B) |
+| `0xEE` | Visual state (LEDs) | state: 0=idle, 1=listening, 2=thinking (teal chase), 3=speaking |
+
+The server sends `0xEE` 2 (thinking) when the user stops talking and again after a stall or early-played sentence, and `0xEE` 0 (idle) at the end of every turn. The pod applies a state sent during playback only after that playback ends; it drops thinking by itself after 200 s.
 
 A zero-length Opus frame (`0x00 0x00`) signals end of speech.
 

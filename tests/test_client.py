@@ -172,6 +172,10 @@ class TestClient:
                 else:
                     print(f"\n  MIC TIMEOUT: {timeout}s")
 
+            elif cmd == 0xEE:
+                state = {0: "IDLE", 1: "LISTENING", 2: "THINKING", 3: "SPEAKING"}.get(header[1], header[1])
+                print(f"\n  STATE: {state}")
+
             else:
                 print(f"  Unknown command: {cmd:#04x}")
 
