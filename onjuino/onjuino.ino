@@ -1,10 +1,3 @@
-#include <opus_custom.h>
-#include <opus_defines.h>
-#include <opus.h>
-#include <opus_multistream.h>
-#include <opus_projection.h>
-#include <opus_types.h>
-
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>
@@ -24,7 +17,7 @@
 #define  PORT_MULTICAST   12345
 #define  ADDR_MULTICAST   IPAddress(239, 0, 0, 1)
 
-#elifdef TARGET_GROKBOT
+#elif defined(TARGET_GROKBOT)   // not #elifdef: that needs GCC 12+ / C++23
 #define  PORT_UDP_MIC     3100
 #define  PORT_MULTICAST   12346
 #define  ADDR_MULTICAST   IPAddress(239, 0, 0, 2)
@@ -119,9 +112,18 @@ const size_t tcpBufferSize = 512; // for received audio data before processing i
 uint8_t tcpBuffer[tcpBufferSize];
 
 // 20260819 LED Thinking Animation add-on - Device visual state
+// Values match the 0xEE command (STATE_* in pipeline/protocol.py).
+// Only loop() writes visualState (0xEE, 0xAA handler, THINKING timeout);
+// updateLedTask only reads it.
 enum DeviceVisualState { VS_IDLE, VS_LISTENING, VS_THINKING, VS_SPEAKING };
 volatile DeviceVisualState visualState = VS_IDLE;
 volatile uint32_t thinkingStartMs = 0;
+// Safety net if the server never sends IDLE (crash, Wi-Fi drop): drop
+// THINKING after this long. Longer than the grok bridge's
+// GROK_RELAY_MAX_WAIT (180 s) so a slow but live answer keeps the chase.
+// The server re-sends THINKING after the stall and each pause-flushed
+// sentence, which restarts this timer.
+#define THINKING_TIMEOUT_MS 200000UL
 
 
 int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playback from TCP
@@ -305,7 +307,7 @@ void setup()
 #if WIFI_DEBUG_LEVEL > 1
     WiFi.onEvent(onWiFiEvent);
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);   // rules out modem-sleep flakiness during connect    
+    WiFi.setSleep(false);   // rules out modem-sleep flakiness during connect
 #endif
 
 #if WIFI_DEBUG_LEVEL
@@ -468,6 +470,14 @@ void loop()
     }
 #endif
 
+    // THINKING timeout (see THINKING_TIMEOUT_MS). Done here rather than in
+    // updateLedTask so visualState keeps a single writer (loop()).
+    if (visualState == VS_THINKING && (millis() - thinkingStartMs) > THINKING_TIMEOUT_MS)
+    {
+        Serial.println("THINKING timed out -> IDLE");
+        visualState = VS_IDLE;
+    }
+
     if (Serial.available())
     {
         char inChar = (char)Serial.read();
@@ -581,14 +591,17 @@ void loop()
             */
             if (header[0] == 0xAA)
             {
-                // 20260819 LED Animation - Update state
-                visualState = VS_SPEAKING;
-
                 if (!deviceEnabled)
                 {
+                    // Nothing will play: leave the LEDs idle, not SPEAKING
+                    // (and stop any THINKING from the turn in progress).
+                    visualState = VS_IDLE;
                     Serial.println("Ignoring audio - device disabled");
                     break;
                 }
+                // 20260819 LED Animation - Update state. Leaving THINKING:
+                // updateLedTask clears the chase pixels on its next tick.
+                visualState = VS_SPEAKING;
                 leds.clear();
                 leds.show();
                 uint16_t timeout = header[1] << 8 | header[2];
@@ -760,7 +773,6 @@ void loop()
                 // 20260819 LED Animation - Update state
                 visualState = VS_IDLE;
 
-
                 if (!PTT_MODE && deviceEnabled) {
                     uint32_t timeout_ms = max((uint32_t)(timeout * 1000), (uint32_t)MIC_LISTEN_MS);
                     mic_timeout = millis() + timeout_ms;
@@ -826,17 +838,33 @@ void loop()
                 mic_timeout = millis() + (uint32_t)timeout * 1000;
             }
 
-            // 20260819 LED Thinking Animation add-on - Device visual state
+            /*
+            header[0]   0xEE for visual state command (20260819 LED Thinking Animation)
+            header[1]   state: 0=idle, 1=listening, 2=thinking, 3=speaking
+            header[2:5] not used
+            Ordering note: this loop() is busy inside the 0xAA handler for the
+            whole playback, so a 0xEE sent during playback waits in the TCP
+            accept backlog and is applied right after playback ends (which has
+            just set IDLE). So the server's end-of-turn IDLE never cuts a
+            playing answer, and a THINKING sent after a stall line / early
+            sentence shows as soon as that audio has finished. No isPlaying
+            check is needed here for that reason.
+            */
             else if (header[0] == 0xEE)
             {
-                // State change command: header[1] = state enum
-                // 0=idle, 1=listening, 2=thinking, 3=speaking
                 uint8_t newState = header[1];
                 Serial.printf("Received state command (0xEE): %d\n", newState);
                 switch (newState) {
                     case 0: visualState = VS_IDLE; break;
                     case 1: visualState = VS_LISTENING; break;
-                    case 2: visualState = VS_THINKING; thinkingStartMs = millis(); break;
+                    case 2:
+                        if (deviceEnabled) {   // disabled by double-tap: stay dark
+                            visualState = VS_THINKING;
+                            thinkingStartMs = millis();
+                        } else {
+                            visualState = VS_IDLE;
+                        }
+                        break;
                     case 3: visualState = VS_SPEAKING; break;
                 }
             }
@@ -1113,14 +1141,34 @@ void updateLedTask(void *parameter)
     const TickType_t xFrequency = pdMS_TO_TICKS(25);
 
     xLastWakeTime = xTaskGetTickCount();
+    bool chaseOn = false; // THINKING chase pixels currently lit
 
     while (1)
     {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
         // 20260819 LED Thinking Animation add-on
-        if (visualState == VS_THINKING)
+        // Priority: 1) mute (red pulse via setLed/ledLevel), 2) playback and
+        // pulses (speaking level, 0xCC VAD blinks, touch flashes: ledLevel),
+        // 3) THINKING chase, only when nothing above is showing.
+        bool showThinking = (visualState == VS_THINKING) && deviceEnabled &&
+                            !mute && !isPlaying && ledLevel == 0;
+
+        if (!showThinking && chaseOn)
         {
+            // Leaving THINKING (0xEE 0, timeout, audio start, or a pulse
+            // taking over): turn the chase pixels off so no frame is frozen.
+            for (int i = 1; i < 5; i++)
+            {
+                leds.setPixelColor(i, 0, 0, 0);
+            }
+            leds.show();
+            chaseOn = false;
+        }
+
+        if (showThinking)
+        {
+            chaseOn = true;
             // Smooth chase: a bright dot orbits LEDs 1-4 with a trailing fade
             uint32_t elapsed = millis() - thinkingStartMs;
             float pos = fmodf((float)elapsed / 400.0f, 4.0f);  // one orbit per 1.6s
@@ -1136,7 +1184,6 @@ void updateLedTask(void *parameter)
             }
             leds.show();
         }
-
         else if (ledLevel > 0)
         {
             if (ledLevel > ledFade)
