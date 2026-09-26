@@ -16,7 +16,7 @@ from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload,
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import send_audio, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection
+from pipeline.protocol import send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)

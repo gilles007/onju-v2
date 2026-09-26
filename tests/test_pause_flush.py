@@ -51,7 +51,7 @@ for _pkg, _attrs in (
 _stub("pipeline.audio", decode_ulaw=_noop, opus_encode=_noop,
       opus_frames_to_tcp_payload=_noop, pcm_to_wav=_noop, OpusStreamEncoder=object)
 _stub("pipeline.device", Device=object, DeviceManager=object)
-_stub("pipeline.protocol", send_audio=_anoop, send_led_blink=_anoop,
+_stub("pipeline.protocol", send_audio=_anoop, send_state=_anoop, send_led_blink=_anoop,
       open_led_connection=_anoop, write_led_blink=_noop, close_led_connection=_anoop,
       open_audio_connection=_anoop, write_audio_frames=_noop, close_audio_connection=_anoop)
 _services = _stub("pipeline.services")
