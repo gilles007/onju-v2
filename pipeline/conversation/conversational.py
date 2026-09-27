@@ -57,7 +57,9 @@ class ConversationalBackend:
     def _wrap_user(self, user_text: str, extra_context: str | None) -> str:
         return f"{extra_context}\n\n{user_text}" if extra_context else user_text
 
-    async def send(self, user_text: str, extra_context: str | None = None) -> str:
+    async def send(self, user_text: str, extra_context: str | None = None,
+                   bot: str | None = None) -> str:
+        # bot (multi-agent routing) is ignored here: one local model, one history.
         self._sanitize()
         self.messages.append({"role": "user", "content": self._wrap_user(user_text, extra_context)})
 
@@ -67,7 +69,8 @@ class ConversationalBackend:
         log.debug(f"[{self.device_id}] LLM: {text}")
         return text
 
-    async def stream(self, user_text: str, extra_context: str | None = None) -> AsyncIterator[str]:
+    async def stream(self, user_text: str, extra_context: str | None = None,
+                     bot: str | None = None) -> AsyncIterator[str]:
         self._sanitize()
         self.messages.append({"role": "user", "content": self._wrap_user(user_text, extra_context)})
 

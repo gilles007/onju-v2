@@ -3,11 +3,14 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 
 @runtime_checkable
 class ConversationBackend(Protocol):
-    async def send(self, user_text: str, extra_context: str | None = None) -> str:
-        """Send a user message, return the full assistant response."""
+    async def send(self, user_text: str, extra_context: str | None = None,
+                   bot: str | None = None) -> str:
+        """Send a user message, return the full assistant response. `bot` is
+        the named agent the turn was routed to (pipeline/agents.py), or None."""
         ...
 
-    def stream(self, user_text: str, extra_context: str | None = None) -> AsyncIterator[str]:
+    def stream(self, user_text: str, extra_context: str | None = None,
+               bot: str | None = None) -> AsyncIterator[str]:
         """Send a user message, yield assistant text deltas as they arrive."""
         ...
 

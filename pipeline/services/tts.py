@@ -9,20 +9,28 @@ from pydub import AudioSegment
 log = logging.getLogger(__name__)
 
 
-async def synthesize(text: str, voice: str, config: dict) -> bytes:
-    """Convert text to 16kHz mono PCM bytes using the configured TTS backend."""
+async def synthesize(text: str, voice: str, config: dict,
+                     voice_override: str | None = None) -> bytes:
+    """Convert text to 16kHz mono PCM bytes using the configured TTS backend.
+
+    voice_override (optional, per call): use this voice instead of the
+    configured one, e.g. the voice of the agent a turn was routed to
+    (pipeline/agents.py). None = unchanged behaviour."""
     backend = config["tts"]["backend"]
     if backend == "elevenlabs":
-        return await _elevenlabs(text, voice, config)
+        return await _elevenlabs(text, voice_override or voice, config)
     if backend in ("local", "local_stream"):
         cfg = config["tts"].get(backend, config["tts"].get("local", {}))
-        return await _local(text, config, cfg_override=cfg)
+        return await _local(text, config, cfg_override=cfg, voice_override=voice_override)
     raise ValueError(f"Unknown TTS backend: {backend}")
 
 
 
-async def synthesize_stream(text: str, voice: str, config: dict):
+async def synthesize_stream(text: str, voice: str, config: dict,
+                            voice_override: str | None = None):
     """Async generator yielding pipeline-rate (16k) mono s16le PCM chunks.
+
+    voice_override: see synthesize(); it wins over tts.<backend>.voice.
 
     backend != 'local_stream': one chunk — the whole sentence via synthesize(),
     byte-identical to today's behavior (Kokoro path untouched).
@@ -32,7 +40,7 @@ async def synthesize_stream(text: str, voice: str, config: dict):
     """
     backend = config["tts"]["backend"]
     if backend != "local_stream":
-        yield await synthesize(text, voice, config)
+        yield await synthesize(text, voice, config, voice_override=voice_override)
         return
 
     cfg = config["tts"]["local_stream"]
@@ -41,7 +49,7 @@ async def synthesize_stream(text: str, voice: str, config: dict):
     payload = {
         "model": cfg.get("model", "qwen3-tts-fast"),
         "input": text,
-        "voice": cfg.get("voice", "") or voice or "default",
+        "voice": voice_override or cfg.get("voice", "") or voice or "default",
         "response_format": "wav",
         "stream": True,
         "sampling_rate": target_rate,
@@ -105,14 +113,15 @@ async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
     return audio.raw_data
 
 
-async def _local(text: str, config: dict, cfg_override=None) -> bytes:
+async def _local(text: str, config: dict, cfg_override=None,
+                 voice_override: str | None = None) -> bytes:
     local_cfg = cfg_override or config["tts"]["local"]
     url = local_cfg["url"].rstrip("/") + "/v1/audio/speech"
 
     payload = {
         "model": local_cfg["model"],
         "input": text,
-        "voice": local_cfg.get("voice", "af_heart"),
+        "voice": voice_override or local_cfg.get("voice", "af_heart"),
         "response_format": "wav",
     }
 

@@ -32,7 +32,8 @@ class AgenticBackend:
             },
         )
 
-    def _build_kwargs(self, user_text: str, extra_context: str | None = None) -> dict:
+    def _build_kwargs(self, user_text: str, extra_context: str | None = None,
+                      bot: str | None = None) -> dict:
         voice_prompt = self.cfg.get("voice_prompt")
         parts = []
         if voice_prompt:
@@ -47,20 +48,29 @@ class AgenticBackend:
             max_tokens=self.cfg.get("max_tokens", 300),
             user=self.device_id,
         )
+        extra_headers = {}
         if self.cfg.get("provider_model"):
-            kwargs["extra_headers"] = {"x-openclaw-model": self.cfg["provider_model"]}
+            extra_headers["x-openclaw-model"] = self.cfg["provider_model"]
+        if bot:
+            # Multi-agent routing (pipeline/agents.py): which named agent this
+            # turn is for. Only sent when an `agents:` section is configured.
+            extra_headers["X-Onju-Bot"] = bot
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
         return kwargs
 
-    async def send(self, user_text: str, extra_context: str | None = None) -> str:
+    async def send(self, user_text: str, extra_context: str | None = None,
+                   bot: str | None = None) -> str:
         response = await self.client.chat.completions.create(
-            **self._build_kwargs(user_text, extra_context)
+            **self._build_kwargs(user_text, extra_context, bot)
         )
         text = response.choices[0].message.content or ""
         log.debug(f"[{self.device_id}] managed LLM: {text}")
         return text
 
-    async def stream(self, user_text: str, extra_context: str | None = None) -> AsyncIterator[str]:
-        kwargs = self._build_kwargs(user_text, extra_context)
+    async def stream(self, user_text: str, extra_context: str | None = None,
+                     bot: str | None = None) -> AsyncIterator[str]:
+        kwargs = self._build_kwargs(user_text, extra_context, bot)
         kwargs["stream"] = True
         stream = await self.client.chat.completions.create(**kwargs)
         async for chunk in stream:
