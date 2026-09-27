@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 import numpy as np
 import yaml
 
-from pipeline import bargein
+from pipeline import agents, bargein
 from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, OpusStreamEncoder
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
@@ -245,9 +245,12 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
     tcp_port = config["network"]["tcp_port"]
     dev_cfg = config["device"]
     no_speech_threshold = 0.45
+    # Multi-agent routing (2026-09-27): None unless the config has `agents:`.
+    router = agents.router_from_config(config)
 
     while True:
         device, audio_int16 = await utterance_queue.get()
+        route: agents.Route | None = None
 
         device.processing = True
         device.interrupted.clear()
@@ -291,6 +294,29 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             if device.interrupted.is_set():
                 log.info(f"Interrupted before LLM")
                 continue
+
+            # Multi-agent routing (optional `agents:` section, see
+            # pipeline/agents.py). Decided here, before the stall, so the
+            # stall line and the reply both use the chosen agent's voice.
+            # The agent's name goes upstream as X-Onju-Bot; the address
+            # ("Hey Ruby,") is dropped from the text if strip_address is on.
+            # Without an `agents:` section none of this runs.
+            tts_kwargs: dict = {}
+            conv_kwargs: dict = {}
+            if router is not None:
+                route = router.route(device.hostname, text)
+                conv_kwargs["bot"] = route.agent
+                if route.voice:
+                    tts_kwargs["voice_override"] = route.voice
+                heard = ""
+                if route.address is not None:
+                    heard = f", heard {route.address.heard!r}"
+                    if route.address.distance:
+                        heard += f" ~{route.address.distance}"
+                log.info(f"AGENT {route.agent} ({route.reason}{heard}) "
+                         f"voice={route.voice or 'tts default'}"
+                         f"{f' text={route.text!r}' if route.text != text else ''}")
+                text = route.text
 
             # Streaming LLM → sentence-buffered TTS → Opus → TCP.
             # Intermediate sends use mic_timeout=0 so the mic only reopens after
@@ -345,7 +371,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
                 try:
                     async for pcm in tts.synthesize_stream(
-                            sentence, device.voice, config):
+                            sentence, device.voice, config, **tts_kwargs):
                         if device.interrupted.is_set():
                             log.info(f"Interrupted mid-stream "
                                      f"({n_frames} frames sent)")
@@ -478,7 +504,8 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             async def produce_sentences():
                 try:
                     async for s in sentence_chunks(
-                        device.conversation.stream(text, extra_context=extra_context)
+                        device.conversation.stream(text, extra_context=extra_context,
+                                                   **conv_kwargs)
                     ):
                         await sentence_q.put(s)
                 except asyncio.CancelledError:
@@ -622,6 +649,8 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     pass
         finally:
             device.processing = False
+            if route is not None:
+                router.touch(device.hostname)   # sticky clock runs from the turn's end
             # LED: every turn ends in IDLE, whatever path it took (answer,
             # no speech, interrupt, LLM failure with no stall, PTT with an
             # empty reply, pipeline error), so THINKING can't get stuck.
@@ -750,6 +779,10 @@ def _log_startup_summary(config: dict) -> None:
     else:
         log.info(f"  LLM   conversational: {backend_cfg.get('model', '?')} "
                  f"@ {backend_cfg.get('base_url', '?')}")
+
+    router = agents.router_from_config(config)
+    if router is not None:
+        log.info(f"  AGENTS {router.describe()}")
 
     tts_cfg = config["tts"]
     tts_backend = tts_cfg.get("backend", "?")
