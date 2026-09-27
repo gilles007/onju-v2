@@ -119,6 +119,30 @@ tts:
       Emma: "56bWURjYFHyYyVf490Dp"          # female, better on small speakers
       Rachel: "21m00Tcm4TlvDq8ikWAM"        # add your voice IDs here
 
+# Named agents (optional). Leave commented out for a single assistant: without
+# this section nothing below applies and turns work exactly as before.
+# With it, a name said at the start of the utterance ("Hey Ruby, ...",
+# "Data, ...", "Okay Pepper ...") picks the agent for this turn and its TTS
+# voice, for the stall line and the reply. The name is sent to the agentic
+# backend as the X-Onju-Bot header. Follow-ups stay with the same agent until
+# another name is spoken or sticky_timeout_s passes. Speech-to-text
+# misspellings are matched fuzzily (see pipeline/agents.py); add known ones
+# as aliases. Voices must exist on the TTS server in use.
+# agents:
+#   default: pepper                          # answers when nobody is named
+#   sticky_timeout_s: 300                    # follow-ups stay with the last agent this long
+#   strip_address: true                      # send "what's up?" instead of "Hey Ruby, what's up?"
+#   list:
+#     - name: pepper
+#       aliases: [peppa]
+#       voice: pepper
+#     - name: data
+#       voice: data
+#     - name: ruby                           # no voice: uses the default agent's voice
+#       aliases: [rubi, rubie]
+#     - name: robin
+#       aliases: [robyn, robbin, rubin]
+
 vad:
   threshold: 0.5                             # speech onset probability
   neg_threshold: 0.35                        # speech offset probability (hysteresis)

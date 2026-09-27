@@ -117,6 +117,12 @@ Agentic requests can take 5-60+ seconds while the gateway runs tools, so the pip
 
 **The first-turn caveat with OpenClaw.** OpenClaw's OpenAI-compatible endpoint buffers all content from the first agent turn until the first round of tool execution completes. If the model generates an opening sentence and then calls a tool, that sentence is held server-side until the tool finishes. Narration between *subsequent* tool rounds streams fine. This is why the stall classifier exists: it gives the user a fast spoken acknowledgment that bypasses the gateway's first-turn buffering. See `pipeline/conversation/stall.py`.
 
+### Named agents (optional)
+
+With an `agents:` section in the config, one pod can talk to several named agents, each with its own TTS voice. After speech-to-text, a name at the start of the utterance ("Hey Ruby, ...", "Data, what time is it?", "Okay Pepper ...") picks the agent for the turn; this happens before the stall decision, so the stall line and the reply both use that agent's voice. The agent's name goes to the agentic backend as an `X-Onju-Bot` header, and by default the address itself is dropped from the text ("Hey Ruby, what's up?" becomes "What's up?"). Follow-ups stay with the same agent (per pod) until another name is spoken or `sticky_timeout_s` passes; then the `default` agent answers again.
+
+Names are matched fuzzily so speech-to-text misspellings still work (Rubie, Rooby -> Ruby; Robbin, Robyn -> Robin), with limits that keep similar names apart: see `pipeline/agents.py` for the rules. Without a greeting the name must be followed by punctuation or be the whole utterance, so "Data shows..." is not an address. Without an `agents:` section none of this runs.
+
 ## Installation
 
 ### Server
@@ -215,6 +221,7 @@ See [`pipeline/config.yaml.example`](pipeline/config.yaml.example) for all optio
 | `conversation.agentic` | OpenClaw gateway URL, auth token, message channel |
 | `conversation.stall` | Fast classifier that decides if the agentic backend needs a brief spoken stall |
 | `tts` | TTS backend (`"elevenlabs"` or `"local"`), voice settings |
+| `agents` | Optional named agents: names/aliases, TTS voice per agent, default agent, sticky timeout (see "Named agents") |
 | `vad` | Voice activity detection thresholds and timing; when speech may interrupt a reply on VOX pods (`interrupt_min_ms`, `interrupt_only_while_playing`) |
 | `network` | UDP/TCP/multicast ports |
 | `device` | Volume, mic timeout, LED settings, greeting audio |
@@ -250,10 +257,11 @@ python tests/test_stall.py
 python tests/test_stream.py
 python tests/test_stream.py "your prompt here"
 
-# Offline checks (localhost only, no hardware): pause flush, LED states, VOX barge-in
+# Offline checks (localhost only, no hardware): pause flush, LED states, VOX barge-in, named agents
 python tests/test_pause_flush.py
 python tests/test_led_state.py
 python tests/test_vox_interrupt.py
+python tests/test_agents.py
 
 # Serial monitor (auto-detects USB port)
 python serial_monitor.py
