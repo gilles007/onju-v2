@@ -41,7 +41,6 @@ async def synthesize_stream(text: str, voice: str, config: dict):
     payload = {
         "model": cfg.get("model", "qwen3-tts-fast"),
         "input": text,
-        "voice": voice or cfg.get("voice", ""),
         "voice": cfg.get("voice", "") or voice or "default",
         "response_format": "wav",
         "stream": True,
