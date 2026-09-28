@@ -56,6 +56,15 @@ async def synthesize_stream(text: str, voice: str, config: dict,
         "temperature": cfg.get("temperature", 0.1),
         "top_k": cfg.get("top_k", 1),
         "do_sample": cfg.get("do_sample", False),
+        # 1.2, not the server's default 1.05. With greedy decoding (the line
+        # above) and the Pepper voice, the TTS sometimes starts with seconds
+        # of silence (up to 9 s before "Hello there."), adds up to 5 s of
+        # silence after the words, or says a long sentence twice. The penalty
+        # stops it picking the same (silence) code over and over. Bench
+        # (ruby-stack tools/tts_babble_bench.py, 40 Pepper takes each): more
+        # than 1.5 s of dead air in 13 takes -> 1, the sentence said twice
+        # once -> never, words unchanged. Set 1.05 here to get the old sound.
+        "repetition_penalty": cfg.get("repetition_penalty", 1.2),
     }
 
     header = b""
