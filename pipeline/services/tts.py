@@ -8,6 +8,18 @@ from pydub import AudioSegment
 
 log = logging.getLogger(__name__)
 
+# Optional generation fields of qwen3-tts-new's /v1/audio/speech (SpeechRequest
+# in ruby-stack qwen3-tts-new/server.py). A key that is absent from the
+# backend's config section, or set to null, is not sent: the server then uses
+# its own default, so an unset key gives exactly the payload of before.
+SAMPLING_KEYS = ("temperature", "top_k", "top_p", "do_sample",
+                 "repetition_penalty", "seed")
+
+
+def sampling_fields(cfg: dict) -> dict:
+    """The SAMPLING_KEYS that are set (not None) in a tts.<backend> section."""
+    return {k: cfg[k] for k in SAMPLING_KEYS if cfg.get(k) is not None}
+
 
 async def synthesize(text: str, voice: str, config: dict) -> bytes:
     """Convert text to 16kHz mono PCM bytes using the configured TTS backend."""
@@ -58,6 +70,10 @@ async def synthesize_stream(text: str, voice: str, config: dict):
         # once -> never, words unchanged. Set 1.05 here to get the old sound.
         "repetition_penalty": cfg.get("repetition_penalty", 1.2),
     }
+    # top_p and seed: sent only when set in tts.local_stream (the keys above
+    # keep their defaults). seed: same text + voice + settings -> same audio.
+    for k, v in sampling_fields(cfg).items():
+        payload.setdefault(k, v)
 
     header = b""
     src_rate = None
@@ -132,6 +148,12 @@ async def _local(text: str, config: dict, cfg_override=None) -> bytes:
     ref_text = local_cfg.get("ref_text")
     if ref_text:
         payload["ref_text"] = ref_text
+
+    # Sampling (qwen3-tts-new): only the keys set in tts.local are sent, so a
+    # config without them (Kokoro, Hermes) posts exactly the payload of before.
+    # E.g. temperature 0.1, top_k 1, do_sample false, repetition_penalty 1.2
+    # (local_stream's greedy settings) and a seed for repeatable audio.
+    payload.update(sampling_fields(local_cfg))
 
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(url, json=payload)
