@@ -110,6 +110,14 @@ tts:
     model: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit"
     ref_audio: ""
     ref_text: ""
+    # Optional, for qwen3-tts-new (ruby-stack): sent only when set, so leave
+    # them out for Kokoro. Greedy + a fixed seed = the same audio every time.
+    # temperature: 0.1
+    # top_k: 1
+    # top_p: 1.0
+    # do_sample: false
+    # repetition_penalty: 1.2
+    # seed: 7
   elevenlabs:
     api_key: ""                              # your ElevenLabs API key
     default_voice: "Archer"
