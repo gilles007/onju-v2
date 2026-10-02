@@ -216,20 +216,25 @@ class Encoder50:
 
 class PlayRecorder(ls.StateRecorder):
     """Also notes the pod's estimated playback state when each sentence's
-    audio connection is open (TTS starts) and after its audio was sent."""
+    TTS starts, once its first audio was written (the pod connection is
+    opened then) and after all its audio was sent."""
 
     def __init__(self):
         super().__init__()
-        self.play_log = []     # (sentence, "open"/"sent", is_playing, playing_until - t0)
+        self.play_log = []     # (sentence, "tts"/"open"/"sent", is_playing, playing_until - t0)
 
     def _note(self, sentence, what):
         b = bargein._by_host["onju-test"]
         self.play_log.append((sentence, what, b.is_playing(), b.playing_until - self.t0))
 
     async def synthesize_stream(self, sentence, voice, config):
-        self._note(sentence, "open")
+        self._note(sentence, "tts")
+        first = True
         async for pcm in super().synthesize_stream(sentence, voice, config):
             yield pcm
+            if first:   # main.py has opened the connection and written the batch
+                self._note(sentence, "open")
+                first = False
         self._note(sentence, "sent")   # runs after main.py wrote the frames
 
 
@@ -269,7 +274,9 @@ async def turn_playback_test():
     log_ = {(s, w): (p, u) for s, w, p, u in rec.play_log}
     t_stall, t_ans = rec.time_of(stall), rec.time_of(answer)
     # Each fake sentence is 1 s of audio (50 frames of 20 ms).
-    check("turn: pod counts as playing once the stall's audio connection is open",
+    check("turn: not counted as playing while the stall's TTS runs (nothing sent yet)",
+          log_[(stall, "tts")][0] is False, f"{rec.play_log}")
+    check("turn: pod counts as playing once the stall's first audio is written",
           log_[(stall, "open")][0] is True, f"{rec.play_log}")
     until = log_[(stall, "sent")][1]
     check("turn: stall estimated to play until its start + 1 s + margin",
