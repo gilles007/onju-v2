@@ -326,22 +326,55 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 max_audio_bytes = config["audio"]["sample_rate"] * 2 * 45  # 45s hard cap
 
                 mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
-                writer = await open_audio_connection(
-                    device.ip, tcp_port,
-                    mic_timeout=mic_timeout,
-                    volume=dev_cfg["default_volume"],
-                    fade=dev_cfg["led_fade"])
-                if writer is None:
-                    log.error(f"Failed to open audio connection to {device.ip}")
-                    return False
-
-                # Playback estimate for VOX barge-in: this sentence starts
-                # playing when the previous one has finished (or now), and
-                # lasts as long as the audio sent so far (+ a margin, see
-                # pipeline/bargein.py). Updated after every batch of frames.
                 barge = bargein.for_device(device, config)
-                seg_start = barge.start_segment()
                 frame_s = opus_frame_size / sample_rate
+
+                # The pod connection is opened only when the first audio is
+                # ready to write (first batch, or the end of the sentence),
+                # not before the TTS call (2026-10-01, Ruby). Once the pod
+                # has read the 6-byte header it waits at most 2 s for the
+                # first Opus frame ("Opus task: TCP stalled waiting for frame
+                # length", onjuino.ino), then closes the connection and plays
+                # nothing. Whole-sentence TTS (backend local with Qwen) takes
+                # 2-3 s, so with the connection opened first every sentence
+                # but the shortest was lost, while the server still logged it
+                # as sent. Still one connection per sentence (28134ec).
+                writer = None
+                seg_start = 0.0
+                open_failed = False
+                cancelled = False
+                lost_warned = False
+
+                async def open_pod() -> bool:
+                    nonlocal writer, seg_start, open_failed
+                    writer = await open_audio_connection(
+                        device.ip, tcp_port,
+                        mic_timeout=mic_timeout,
+                        volume=dev_cfg["default_volume"],
+                        fade=dev_cfg["led_fade"])
+                    if writer is None:
+                        open_failed = True
+                        log.error(f"Failed to open audio connection to {device.ip}")
+                        return False
+                    # Playback estimate for VOX barge-in: this sentence starts
+                    # playing when the previous one has finished (or now), and
+                    # lasts as long as the audio sent so far (+ a margin, see
+                    # pipeline/bargein.py). Updated after every batch of frames.
+                    seg_start = barge.start_segment()
+                    return True
+
+                def pod_closed() -> bool:
+                    """The pod closed its end (e.g. its 2 s frame timeout):
+                    frames written now are lost. Warned once per sentence."""
+                    nonlocal lost_warned
+                    reader = getattr(writer, "pod_reader", None)
+                    if lost_warned or reader is None or not reader.at_eof():
+                        return False
+                    lost_warned = True
+                    log.warning(f"Pod {device.ip} closed the audio connection after "
+                                f"{n_frames} frames; the rest of {sentence!r} is lost "
+                                f"(pod waits at most 2 s for each frame)")
+                    return True
 
                 try:
                     async for pcm in tts.synthesize_stream(
@@ -362,6 +395,9 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         ### Comment 7 lines below to send one sentence at a time? (I don't think it's networks stack related, but try)
                         if len(batch_pcm) >= batch_min:
                             frames = enc.encode_chunk(batch_pcm)
+                            if writer is None and not await open_pod():
+                                return False
+                            pod_closed()
                             if frames and not write_audio_frames(writer, frames):
                                 log.error(f"Connection lost mid-stream to {device.ip}")
                                 return False
@@ -369,6 +405,9 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                             n_frames += len(frames)
                             barge.audio_sent(seg_start, n_frames * frame_s)
                             batch_pcm = b""
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
                     return False
@@ -376,17 +415,33 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     # Always close — even on error/interrupt, so the pod
                     # gets EOF and doesn't hang waiting for more frames.
                     tail = enc.encode_chunk(batch_pcm) + enc.flush()
-                    if tail:
-                        write_audio_frames(writer, tail)
-                        n_frames += len(tail)
-                    await close_audio_connection(writer)
-                    barge.audio_sent(seg_start, n_frames * frame_s)
+                    if writer is None and not (open_failed or cancelled):
+                        if device.interrupted.is_set():
+                            # Interrupted before any audio: nothing to play,
+                            # and a header now would stop the pod's mic
+                            # while the user is talking over us.
+                            log.info(f"Interrupted before the first audio; "
+                                     f"no connection opened for {sentence!r}")
+                        else:
+                            # Short sentence (under one batch), no audio at
+                            # all, runaway in a single chunk, or a TTS error:
+                            # the pod still gets the header (mic timeout)
+                            # and end-of-segment, as before.
+                            await open_pod()
+                    if writer is not None:
+                        if tail:
+                            pod_closed()
+                            write_audio_frames(writer, tail)
+                            n_frames += len(tail)
+                        await close_audio_connection(writer)
+                        barge.audio_sent(seg_start, n_frames * frame_s)
 
                 if not is_final:
                     sent_partial = True
 
                 log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
-                         f"tts_first[+{t_first:.2f}s] {n_frames} frames "
+                         f"tts_first[{f'+{t_first:.2f}s' if t_first is not None else 'no audio'}] "
+                         f"{n_frames} frames "
                          f"to {device.ip} "
                          f"({'final' if is_final else 'partial'}: {sentence!r})")
 

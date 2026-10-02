@@ -47,9 +47,13 @@ async def open_audio_connection(ip: str, port: int, mic_timeout: int = 60,
     """Open a persistent TCP connection and send the audio header.
     Returns the writer for incremental frame writes, or None on failure."""
     try:
-        _, writer = await asyncio.wait_for(
+        reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port), timeout=timeout
         )
+        # The pod never sends on this connection; its reader only sees EOF
+        # when the pod closes its end (e.g. its 2 s wait for the next Opus
+        # frame ran out). main.py checks pod_reader.at_eof() before writing.
+        writer.pod_reader = reader
         header = bytes([
             0xAA,
             (mic_timeout >> 8) & 0xFF,

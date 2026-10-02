@@ -94,11 +94,19 @@ class Recorder:
         return time.monotonic() - self.t0
 
     async def open_audio_connection(self, ip, port, mic_timeout, volume, fade):
+        # main.py opens the pod connection when the sentence's first audio
+        # is ready, so the mic timeout of its header is filled in on the
+        # sentence's event here (it is None until then).
         self._mic = mic_timeout
+        for ev in reversed(self.events):
+            if ev[1] == "sentence":
+                if ev[3] is None:
+                    ev[3] = mic_timeout
+                break
         return FakeWriter()
 
     async def synthesize_stream(self, sentence, voice, config):
-        self.events.append((self.now(), "sentence", sentence, self._mic))
+        self.events.append([self.now(), "sentence", sentence, None])
         await asyncio.sleep(0.02)
         yield b"\0\0" * 16000     # 1 s of silence; enough for one batch
 

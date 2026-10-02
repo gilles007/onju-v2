@@ -253,6 +253,7 @@ python tests/test_stream.py "your prompt here"
 # Offline checks (localhost only, no hardware): pause flush, LED states, VOX barge-in
 python tests/test_pause_flush.py
 python tests/test_tts_payload.py   # TTS request payloads (offline)
+python tests/test_pod_connection.py  # when the pod audio connection opens (offline)
 python tests/test_led_state.py
 python tests/test_vox_interrupt.py
 
