@@ -125,6 +125,90 @@ volatile uint32_t thinkingStartMs = 0;
 // sentence, which restarts this timer.
 #define THINKING_TIMEOUT_MS 200000UL
 
+// 20261002 "Thinking" animation v2 (Gilles' thinking_animation.ino, tuned on a
+// Circuit Playground Express at 16 ms/frame, bare LEDs, no gamma table).
+// A comet bounces across the Nest's 4 top LEDs (pixels 1..4 of LED_COUNT 6;
+// pixels 0 and 5 are left alone) over a cycling green/blue/purple/coral/yellow
+// gradient. The math is time-based (millis()), so it does not depend on the
+// frame rate. updateLedTask runs at FRAME_MS only while THINKING is shown and
+// keeps its 25 ms period otherwise (the ledLevel fades are tuned per 25 ms tick).
+// This animation does NOT use gammaCorrectionTable: it dims in linear space,
+// then applies its own LED_GAMMA once.
+#define FRAME_MS 16                        // 16 = ~60 fps, 33 = ~30 fps
+#define LED_FRAME_MS_DEFAULT 25            // updateLedTask period outside THINKING
+// Comet motion: 0 = rotate (continuous one-way spin), 1 = bounce (back and forth)
+#define COMET_MODE_ROTATE  0
+#define COMET_MODE_BOUNCE  1
+#define COMET_MODE         COMET_MODE_BOUNCE
+#define ANIM_LEDS          4               // pixels used by the animation
+#define ANIM_FIRST_LED     1               // first of them on the strip (pixels 1..4)
+// In bounce mode, COMET_REV_S is the full round-trip period (0 -> end -> 0).
+static const float MASTER_BRIGHT = 0.9f;   // overall brightness (0..1)
+static const float COLOR_CYCLE_S = 2.0f;   // seconds for one full gradient loop
+static const float COMET_REV_S   = 1.6f;   // seconds per comet revolution (BOUNCE_PERIOD)
+static const float COLOR_SPREAD  = 0.12f;  // gradient phase offset between LEDs
+static const float BASE_GLOW     = 0.01f;  // minimum brightness (0..1)
+static const float COMET_WIDTH   = 2.0f;   // comet falloff distance, in LED units
+static const float LED_GAMMA     = 1.2f;   // gamma for bare LEDs
+
+// Gradient: green -> blue -> purple -> coral -> yellow (cyclic)
+static const uint8_t PALETTE[][3] = {
+    {0x26, 0xD3, 0x66},
+    {0x19, 0x77, 0xF0},
+    {0xA0, 0x33, 0xFF},
+    {0xFF, 0x6C, 0x5A},
+    {0xFC, 0xD8, 0x23},
+};
+static const int PALETTE_N = sizeof(PALETTE) / sizeof(PALETTE[0]);
+
+static void palette_sample(float p, float rgb[3])
+{
+    p = p - floorf(p);
+    float seg = p * PALETTE_N;
+    int   i   = (int)seg;
+    float f   = seg - i;
+    const uint8_t *a = PALETTE[i % PALETTE_N];
+    const uint8_t *b = PALETTE[(i + 1) % PALETTE_N];
+    for (int k = 0; k < 3; k++) rgb[k] = a[k] + (b[k] - a[k]) * f;
+}
+
+// ms: time since the animation started. out[i] is RGB for animation LED i.
+static void thinking_render(uint32_t ms, uint8_t out[ANIM_LEDS][3])
+{
+    float t = ms / 1000.0f;
+#if COMET_MODE == COMET_MODE_BOUNCE
+    // Sine-eased ping-pong between LED 0 and LED (ANIM_LEDS - 1).
+    float head = (ANIM_LEDS - 1) * 0.5f *
+                 (1.0f - cosf(2.0f * (float)M_PI * t / COMET_REV_S));
+#else
+    float head = fmodf((t / COMET_REV_S) * ANIM_LEDS, (float)ANIM_LEDS);
+#endif
+
+    for (int i = 0; i < ANIM_LEDS; i++)
+    {
+        float rgb[3];
+        palette_sample(t / COLOR_CYCLE_S + i * COLOR_SPREAD, rgb);
+
+        float d = fabsf((float)i - head);
+#if COMET_MODE == COMET_MODE_ROTATE
+        if (d > ANIM_LEDS - d) d = ANIM_LEDS - d;  // ring wrap, rotate mode only
+#endif
+
+        float peak = 1.0f - d / COMET_WIDTH;
+        if (peak < 0.0f) peak = 0.0f;
+        float bright = BASE_GLOW + (1.0f - BASE_GLOW) * peak;
+
+        for (int k = 0; k < 3; k++)
+        {
+            // Dim in linear space BEFORE gamma so we get one clean quantization.
+            float v = rgb[k] * bright * MASTER_BRIGHT / 255.0f;
+            v = powf(v, 1.0f / LED_GAMMA);
+            int q = (int)(v * 255.0f + 0.5f);
+            out[i][k] = (uint8_t)(q > 255 ? 255 : q);
+        }
+    }
+}
+
 
 int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playback from TCP
 
@@ -460,7 +544,7 @@ void setup()
     }
 
     xTaskCreatePinnedToCore(micTask, "MicTask", 4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(updateLedTask, "updateLedTask", 2048, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(updateLedTask, "updateLedTask", 3072, NULL, 2, NULL, 1); // 3072: float math (powf/cosf) in thinking_render
     xTaskCreatePinnedToCore(touchTask, "TouchTask", 2048, NULL, 2, NULL, 1);
 }
 
@@ -1176,10 +1260,11 @@ void updateLedTask(void *parameter)
 {
     Serial.println("Started updateLedTask");
     TickType_t xLastWakeTime;
-    const TickType_t xFrequency = pdMS_TO_TICKS(25);
+    TickType_t xFrequency = pdMS_TO_TICKS(LED_FRAME_MS_DEFAULT);
 
     xLastWakeTime = xTaskGetTickCount();
-    bool chaseOn = false; // THINKING chase pixels currently lit
+    bool chaseOn = false;        // THINKING animation pixels currently lit
+    uint32_t animStartMs = 0;    // animation clock, restarts each time it shows
 
     while (1)
     {
@@ -1188,15 +1273,21 @@ void updateLedTask(void *parameter)
         // 20260819 LED Thinking Animation add-on
         // Priority: 1) mute (red pulse via setLed/ledLevel), 2) playback and
         // pulses (speaking level, 0xCC VAD blinks, touch flashes: ledLevel),
-        // 3) THINKING chase, only when nothing above is showing.
+        // 3) THINKING animation, only when nothing above is showing
+        // (so it is always off while audio plays).
         bool showThinking = (visualState == VS_THINKING) && deviceEnabled &&
                             !mute && !isPlaying && ledLevel == 0;
+
+        // ~60 fps while THINKING, the original 25 ms otherwise. Cheap: a
+        // 6-pixel show() is ~0.2 ms on core 1, and THINKING never overlaps
+        // playback (I2S out) since !isPlaying is required above.
+        xFrequency = pdMS_TO_TICKS(showThinking ? FRAME_MS : LED_FRAME_MS_DEFAULT);
 
         if (!showThinking && chaseOn)
         {
             // Leaving THINKING (0xEE 0, timeout, audio start, or a pulse
-            // taking over): turn the chase pixels off so no frame is frozen.
-            for (int i = 1; i < 5; i++)
+            // taking over): turn the animation pixels off so no frame is frozen.
+            for (int i = ANIM_FIRST_LED; i < ANIM_FIRST_LED + ANIM_LEDS; i++)
             {
                 leds.setPixelColor(i, 0, 0, 0);
             }
@@ -1206,19 +1297,20 @@ void updateLedTask(void *parameter)
 
         if (showThinking)
         {
-            chaseOn = true;
-            // Smooth chase: a bright dot orbits LEDs 1-4 with a trailing fade
-            uint32_t elapsed = millis() - thinkingStartMs;
-            float pos = fmodf((float)elapsed / 400.0f, 4.0f);  // one orbit per 1.6s
-
-            for (int i = 1; i < 5; i++)
+            if (!chaseOn)
             {
-                float dist = fmodf(fabsf((float)(i - 1) - pos) + 4.0f, 4.0f);
-                if (dist > 2.0f) dist = 4.0f - dist;  // wrap-around distance
-                float brightness = fmaxf(0.0f, 1.0f - dist * 0.6f);
-                uint8_t level = gammaCorrectionTable[(uint8_t)(brightness * 200.0f)];
-                // Teal chase — match Vesper's color identity
-                leds.setPixelColor(i, 0, level, level * 180 / 255);
+                // Start each showing at t = 0 (comet on the first LED, green).
+                // Own clock rather than thinkingStartMs, so a re-sent THINKING
+                // doesn't make the animation jump.
+                animStartMs = millis();
+                chaseOn = true;
+            }
+            uint8_t frame[ANIM_LEDS][3];
+            thinking_render(millis() - animStartMs, frame);
+            // Raw values, no gammaCorrectionTable (thinking_render has its own gamma).
+            for (int i = 0; i < ANIM_LEDS; i++)
+            {
+                leds.setPixelColor(ANIM_FIRST_LED + i, frame[i][0], frame[i][1], frame[i][2]);
             }
             leds.show();
         }
