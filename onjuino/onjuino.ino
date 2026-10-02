@@ -129,12 +129,20 @@ volatile uint32_t thinkingStartMs = 0;
 int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playback from TCP
 
 // how many samples to load from TCP before starting playing (avoid jitter due to running out of data w/ bad wifi)
-// With Opus compression, we can use smaller buffers (less latency)
+// PSRAM boards: 1 s of pre-buffer. On a lossy pod link a single lost TCP segment
+// costs one retransmission timeout (RTO ~0.7 s measured 2026-10-01, rtt 121 ms +
+// 4*rttvar); the old 256 ms pre-buffer + 128 ms DMA ring (~0.4 s) underran and the
+// DMA ring replayed its last buffers ("A Cris is is is"). 1 s covers one RTO.
+// Streams that end before the threshold are still played (flushed at stream end).
 #ifdef USE_PSRAM
-int bufferThreshold = 4096;  // 256ms @ 16kHz (12.8 frames @ 20ms)
+int bufferThreshold = 16000; // 1000ms @ 16kHz (50 frames @ 20ms)
 #else
 int bufferThreshold = 1024;  // 64ms @ 16kHz (3.2 frames @ 20ms)
 #endif
+
+// Give up on an open-but-silent playback TCP stream after this long without data.
+// Must comfortably exceed a TCP retransmission (or two) on a bad Wi-Fi link.
+#define TCP_STALL_TIMEOUT_MS 5000UL
 
 // Mic settings
 #define SAMPLE_CHUNK_SIZE 512                  // 32ms at 16kHz for Silero VAD, fits in UDP packet (512 bytes μ-law < 1400)
@@ -173,7 +181,8 @@ i2s_config_t i2s_config = {
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 4,
-    .dma_buf_len = SAMPLE_CHUNK_SIZE}; // mostly set by needs of microphone
+    .dma_buf_len = SAMPLE_CHUNK_SIZE, // mostly set by needs of microphone
+    .tx_desc_auto_clear = true};      // on TX underrun send silence instead of replaying the last DMA buffers
 
 i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_BCK_PIN,
@@ -433,7 +442,9 @@ void setup()
     Serial.println("PSRAM used: " + String(total_psram - free_psram));
 #else
     Serial.println("Allocating wavData - no PSRAM");
-    wavData = (int32_t *)malloc((bufferThreshold * 4));
+    // threshold + headroom: one Opus frame (320) or one PCM read (tcpBufferSize/2)
+    // can be appended past the threshold before it is drained
+    wavData = (int32_t *)malloc((bufferThreshold + OPUS_FRAME_SIZE + tcpBufferSize / 2) * sizeof(int32_t));
 #endif
 
     // Initialize Opus decoder
@@ -730,7 +741,7 @@ void loop()
                                 totalSamplesRead = 0;
                             }
                         }
-                        else if (millis() - pcmReadStart > 2000)
+                        else if (millis() - pcmReadStart > TCP_STALL_TIMEOUT_MS)
                         {
                             // TCP froze with connection still open — force-close so we
                             // don't loop the I2S DMA buffer indefinitely.
@@ -742,6 +753,16 @@ void loop()
                         {
                             delay(2);
                         }
+                    }
+
+                    // Stream ended before the pre-buffer threshold was reached (short
+                    // sentence, or a stall): play what we have instead of dropping it.
+                    if (!interruptPlayback && totalSamplesRead > 0)
+                    {
+                        Serial.println("PCM stream ended before buffer threshold, playing " + String(totalSamplesRead) + " samples");
+                        bytesWritten = 0;
+                        i2s_write(I2S_NUM, (uint8_t *)wavData, totalSamplesRead * 4, &bytesWritten, portMAX_DELAY);
+                        totalSamplesRead = 0;
                     }
 
                     wasInterrupted = interruptPlayback;
@@ -924,7 +945,7 @@ void opusDecodeTask(void *pvParameters)
             {
                 break;
             }
-            else if (millis() - readStart > 2000)
+            else if (millis() - readStart > TCP_STALL_TIMEOUT_MS)
             {
                 // TCP froze with connection still open — force-close so the outer
                 // loop bails instead of looping the I2S DMA buffer indefinitely.
@@ -967,7 +988,7 @@ void opusDecodeTask(void *pvParameters)
                 bytes_read += client->read(opus_packet_buffer + bytes_read, to_read);
                 frameReadStart = millis();
             }
-            else if (millis() - frameReadStart > 2000)
+            else if (millis() - frameReadStart > TCP_STALL_TIMEOUT_MS)
             {
                 Serial.println("Opus task: TCP stalled mid-frame, closing connection");
                 client->stop();
@@ -1028,7 +1049,24 @@ void opusDecodeTask(void *pvParameters)
         }
     }
 
-    i2s_zero_dma_buffer(I2S_NUM);
+    if (interruptPlayback)
+    {
+        i2s_zero_dma_buffer(I2S_NUM);
+    }
+    else
+    {
+        // Stream ended before the pre-buffer threshold was reached (short sentence,
+        // or a stall): play what we have instead of dropping it.
+        if (totalSamplesRead > 0)
+        {
+            Serial.printf("Stream ended before buffer threshold, playing %u samples\n", (unsigned)totalSamplesRead);
+            size_t bytesWritten = 0;
+            i2s_write(I2S_NUM, (uint8_t *)wavData, totalSamplesRead * 4, &bytesWritten, portMAX_DELAY);
+            totalSamplesRead = 0;
+        }
+        // No zeroing here: the last ~128 ms still in the DMA ring is real audio. The
+        // caller flushes silence behind it, and tx_desc_auto_clear keeps it silent after.
+    }
     Serial.println("Opus decode task finished");
     opusTaskRunning = false;
     vTaskDelete(NULL);
