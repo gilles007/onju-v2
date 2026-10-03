@@ -126,7 +126,9 @@ async def send_led_blink(ip: str, port: int, intensity: int, r: int = 255, g: in
 
 
 async def send_stop_listening(ip: str, port: int, hold_s: int = 0):
-    """Unused by pipeline — kept for sesame-esp32-bridge compatibility."""
+    """0xDD: set the pod's mic timeout to hold_s from now (0 = close the mic).
+    Used by the say endpoint (main.py play_say) after its audio; also kept for
+    sesame-esp32-bridge compatibility."""
     header = bytes([0xDD, (hold_s >> 8) & 0xFF, hold_s & 0xFF, 0, 0, 0])
     await send_tcp(ip, port, header, timeout=0.2)
 
