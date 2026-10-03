@@ -312,6 +312,68 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 #endif
 
 
+// ---- Playback + speaking-LED meter ----
+// Audio is written to I2S in DMA-buffer-sized chunks, and each chunk's level is
+// fed to the speaking LEDs just before that chunk is queued. i2s_write() blocks
+// until the 4 x 32 ms DMA ring has room, so the LEDs track the sound with at
+// most ~128 ms lead, however big the block is (the 1 s pre-buffer, a short-stream
+// flush, or a single 20 ms Opus frame). Before 2026-10-02 the level was taken
+// once per block from its first 8 ms, so the 1 s pre-buffer left the LEDs dark
+// for ~1 s per sentence and sentences < 1 s (flushed at stream end) never lit.
+#define PLAY_CHUNK_SAMPLES 512 // = dma_buf_len (32 ms @ 16 kHz)
+#define LED_METER_STRIDE   4   // meter every 4th sample (128 per full chunk)
+// Speaking-LED sensitivity. level = (sum of |sample| over 128 metered samples)
+// >> LED_METER_SHIFT, i.e. mean |sample| / 8 at 10 (same scale as the old
+// 32-sample >> 8). Lower = brighter / more sensitive (9 doubles it). Clamped to
+// 255. The decay is led_fade in the server config (per 25 ms LED tick).
+#define LED_METER_SHIFT    10
+
+// Play n samples of wavData-format audio (int32, already << speaker_volume) and
+// meter it for the speaking LEDs. Checks interruptPlayback between chunks, so a
+// tap stops playback within one chunk (~32 ms of blocking). Returns false if
+// interrupted (the rest of the block is not queued).
+bool playAndMeter(const int32_t *buf, size_t n)
+{
+    size_t pos = 0;
+    while (pos < n)
+    {
+        if (interruptPlayback)
+        {
+            return false;
+        }
+        size_t len = n - pos;
+        if (len > PLAY_CHUNK_SAMPLES)
+        {
+            len = PLAY_CHUNK_SAMPLES;
+        }
+
+        // Undo the volume shift per sample first: int16 magnitudes keep the sum
+        // well inside 32 bits (128 * 32768 = 2^22) at any volume.
+        uint32_t sum = 0;
+        uint32_t count = 0;
+        for (size_t i = 0; i < len; i += LED_METER_STRIDE)
+        {
+            sum += (uint32_t)abs(buf[pos + i] >> speaker_volume);
+            count++;
+        }
+        // Scale a short tail chunk up to 128 metered samples so it isn't dimmer.
+        uint32_t level = (sum * (PLAY_CHUNK_SAMPLES / LED_METER_STRIDE) / count) >> LED_METER_SHIFT;
+        if (level > 255)
+        {
+            level = 255;
+        }
+        if (level > ledLevel)
+        {
+            ledLevel = level;
+        }
+
+        size_t bytesWritten = 0;
+        i2s_write(I2S_NUM, (const uint8_t *)(buf + pos), len * sizeof(int32_t), &bytesWritten, portMAX_DELAY);
+        pos += len;
+    }
+    return true;
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -718,9 +780,8 @@ void loop()
                 uint32_t tic = millis();
                 size_t totalSamplesRead = 0;
 
-                size_t bytesAvailable, bytesToRead, bytesRead, bytesWritten, bytesToWrite;
+                size_t bytesAvailable, bytesToRead, bytesRead;
                 int16_t sample16;
-                uint32_t sum = 0;
                 bool wasInterrupted = false;
 
                 // Handle Opus compressed audio
@@ -802,26 +863,7 @@ void loop()
                                     initialBufferFilled = true;
                                 }
 
-                                bytesToWrite = totalSamplesRead * 4;
-                                bytesWritten = 0;
-
-                                i2s_write(I2S_NUM, (uint8_t *)wavData, bytesToWrite, &bytesWritten, portMAX_DELAY);
-
-                                if (millis() - tic > 30)
-                                {
-                                    tic = millis();
-                                    for (int i = 0; i < 128; i += 4)
-                                    {
-                                        sum += abs(wavData[i]);
-                                    }
-                                    uint8_t sum_u8 = sum >> (speaker_volume + 8);
-
-                                    if (sum_u8 > ledLevel)
-                                    {
-                                        ledLevel = sum_u8;
-                                    }
-                                    sum = 0;
-                                }
+                                playAndMeter(wavData, totalSamplesRead);
                                 totalSamplesRead = 0;
                             }
                         }
@@ -844,8 +886,7 @@ void loop()
                     if (!interruptPlayback && totalSamplesRead > 0)
                     {
                         Serial.println("PCM stream ended before buffer threshold, playing " + String(totalSamplesRead) + " samples");
-                        bytesWritten = 0;
-                        i2s_write(I2S_NUM, (uint8_t *)wavData, totalSamplesRead * 4, &bytesWritten, portMAX_DELAY);
+                        playAndMeter(wavData, totalSamplesRead);
                         totalSamplesRead = 0;
                     }
 
@@ -1003,8 +1044,6 @@ void opusDecodeTask(void *pvParameters)
 
     bool initialBufferFilled = false;
     size_t totalSamplesRead = 0;
-    uint32_t tic = millis();
-    uint32_t sum = 0;
 
     while (client->connected() || client->available())
     {
@@ -1110,25 +1149,7 @@ void opusDecodeTask(void *pvParameters)
                 initialBufferFilled = true;
             }
 
-            size_t bytesToWrite = totalSamplesRead * 4; // int32_t
-            size_t bytesWritten = 0;
-            i2s_write(I2S_NUM, (uint8_t *)wavData, bytesToWrite, &bytesWritten, portMAX_DELAY);
-
-            if (millis() - tic > 30)
-            {
-                tic = millis();
-                for (int i = 0; i < 128; i += 4)
-                {
-                    sum += abs(wavData[i]);
-                }
-                uint8_t sum_u8 = sum >> (speaker_volume + 8);
-
-                if (sum_u8 > ledLevel)
-                {
-                    ledLevel = sum_u8;
-                }
-                sum = 0;
-            }
+            playAndMeter(wavData, totalSamplesRead);
             totalSamplesRead = 0;
         }
     }
@@ -1144,8 +1165,7 @@ void opusDecodeTask(void *pvParameters)
         if (totalSamplesRead > 0)
         {
             Serial.printf("Stream ended before buffer threshold, playing %u samples\n", (unsigned)totalSamplesRead);
-            size_t bytesWritten = 0;
-            i2s_write(I2S_NUM, (uint8_t *)wavData, totalSamplesRead * 4, &bytesWritten, portMAX_DELAY);
+            playAndMeter(wavData, totalSamplesRead);
             totalSamplesRead = 0;
         }
         // No zeroing here: the last ~128 ms still in the DMA ring is real audio. The
