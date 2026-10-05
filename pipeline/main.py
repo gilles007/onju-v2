@@ -854,35 +854,149 @@ async def _one_delta(text: str):
     yield text + " "
 
 
-async def play_say(config: dict, scfg: "say_mod.SayConfig", device, sentences: list[str],
-                   text: str, tts_voice: str | None, bot: str | None,
-                   listen: bool = False) -> dict:
+# How often to re-send STATE_THINKING while a staged say holds the LEDs.
+# Firmware THINKING_TIMEOUT_MS is 200 s, so a single send covers think_s
+# (capped at 30); refreshing matches how a normal turn re-arms THINKING
+# after a stall line / pause-flush (SPEAKING would otherwise leave IDLE).
+THINK_REFRESH_S = 10.0
+
+
+async def _say_sleep(device, seconds: float) -> bool:
+    """Sleep up to `seconds`. Returns False if the pod was interrupted."""
+    if seconds <= 0:
+        return not device.interrupted.is_set()
+    end = time.monotonic() + seconds
+    while True:
+        if device.interrupted.is_set():
+            return False
+        left = end - time.monotonic()
+        if left <= 0:
+            return True
+        await asyncio.sleep(min(0.05, left))
+
+
+async def _say_wait_playback(device, barge) -> bool:
+    """Wait until barge-in estimates the pod has finished playing.
+    Returns False if interrupted. Accuracy is the playback estimate
+    (audio sent + PLAYBACK_MARGIN_S); the pod does not report end-of-play."""
+    while barge.is_playing():
+        if device.interrupted.is_set():
+            return False
+        left = barge.playing_until - time.monotonic()
+        await asyncio.sleep(min(0.05, max(0.0, left)))
+    return not device.interrupted.is_set()
+
+
+async def _say_hold_thinking(config: dict, device, think_s: float) -> bool:
+    """Hold STATE_THINKING for think_s (re-send every THINK_REFRESH_S).
+    Returns False if interrupted. Speaking LEDs take over when the answer
+    audio connection opens (firmware sets VS_SPEAKING on 0xAA)."""
+    if think_s <= 0:
+        return not device.interrupted.is_set()
+    tcp_port = config["network"]["tcp_port"]
+    fire_state(device.ip, tcp_port, STATE_THINKING)
+    end = time.monotonic() + think_s
+    next_refresh = time.monotonic() + THINK_REFRESH_S
+    while True:
+        if device.interrupted.is_set():
+            return False
+        now = time.monotonic()
+        if now >= end:
+            return True
+        if now >= next_refresh:
+            fire_state(device.ip, tcp_port, STATE_THINKING)
+            next_refresh = now + THINK_REFRESH_S
+        await asyncio.sleep(min(0.05, end - now, max(0.0, next_refresh - now)))
+
+
+async def _say_stream_part(config: dict, device, sentences: list[str], *,
+                           t0: float, tts_kwargs: dict, listen: bool) -> tuple[bool, int, int]:
+    """Stream sentences; listen only on the last if listen. Returns
+    (ok, frames, played_count)."""
+    frames = 0
+    played = 0
+    ok = True
+    for i, sentence in enumerate(sentences):
+        last = i == len(sentences) - 1
+        mic = config["device"]["default_mic_timeout"] if (last and listen) else 0
+        ok, n = await stream_sentence(config, device, sentence, is_final=last,
+                                      turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic)
+        frames += n
+        if not ok:
+            break
+        played += 1
+    return ok, frames, played
+
+
+async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
+                   sentences: list[str], text: str, tts_voice: str | None,
+                   bot: str | None, listen: bool = False,
+                   filler_sentences: list[str] | None = None,
+                   filler_text: str | None = None,
+                   think_s: float = 0.0, delay_s: float = 0.0,
+                   barge=None, utterance_queue: asyncio.Queue | None = None) -> dict:
     """Play a say on a pod already claimed by say_request (say_active and
     processing set). Same path as a voice turn: stream_sentence() per
     sentence, so the speaking LEDs, barge-in estimate, SEND lines and debug
-    WAVs all apply. Every sentence goes out with mic timeout 0, and the mic
-    is closed at the end (0xDD), unless `listen`: then the last sentence
-    carries default_mic_timeout like a reply."""
+    WAVs all apply.
+
+    Optional staging (all no-ops when unset, so plain announces are
+    unchanged): delay_s → filler (mic closed) → wait for filler playback →
+    STATE_THINKING for think_s → answer. listen applies only to the final
+    answer sentence; between parts the mic stays closed (mic_timeout 0,
+    and 0xDD only after the answer when listen is false)."""
     tcp_port = config["network"]["tcp_port"]
     frame_s = config["audio"]["opus_frame_size"] / config["audio"]["sample_rate"]
     t0 = time.monotonic()
     tts_kwargs = {"voice_override": tts_voice} if tts_voice else {}
+    if barge is None:
+        barge = bargein.for_device(device, config)
+    filler_sentences = filler_sentences or []
     frames = 0
     played = 0
+    filler_frames = 0
+    filler_played = 0
     ok = True
+    stage = "start"
+    delayed = False
     log.info(f"SAY   {device.hostname} voice={tts_voice or 'tts default'} bot={bot or '-'} "
-             f"{len(sentences)} sentence(s): {text!r}")
+             f"{len(sentences)} sentence(s)"
+             f"{f', filler={filler_text!r}' if filler_text else ''}"
+             f"{f', think_s={think_s:g}' if think_s else ''}"
+             f"{f', delay_s={delay_s:g}' if delay_s else ''}"
+             f": {text!r}")
     try:
-        for i, sentence in enumerate(sentences):
-            last = i == len(sentences) - 1
-            mic = config["device"]["default_mic_timeout"] if (last and listen) else 0
-            ok, n = await stream_sentence(config, device, sentence, is_final=last,
-                                          turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic)
+        if delay_s > 0:
+            stage = "delay"
+            if not await _say_sleep(device, delay_s):
+                ok = False
+            else:
+                delayed = True
+                queued = utterance_queue.qsize() if utterance_queue is not None else 0
+                reason = say_mod.busy_reason(device, barge, queued, ignore_owned=True)
+                if reason:
+                    log.info(f"SAY   aborted after delay on {device.hostname}: {reason}")
+                    ok = False
+                    stage = "delay_busy"
+        if ok and filler_sentences:
+            stage = "filler"
+            ok, n, filler_played = await _say_stream_part(
+                config, device, filler_sentences, t0=t0, tts_kwargs=tts_kwargs, listen=False)
+            filler_frames = n
             frames += n
-            if not ok:
-                break
-            played += 1
-        if ok and not listen and not device.ptt:
+            if ok and not await _say_wait_playback(device, barge):
+                ok = False
+        if ok and think_s > 0:
+            stage = "think"
+            if not await _say_hold_thinking(config, device, think_s):
+                ok = False
+        if ok and sentences:
+            stage = "answer"
+            # Final part of a multi-stage say, or the only part of a plain one.
+            ok, n, played = await _say_stream_part(
+                config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen)
+            frames += n
+        if ok and not listen and not device.ptt and (played or filler_played):
             # The pod opens its mic for at least 20 s after every playback
             # (MIC_LISTEN_MS in onjuino.ino), whatever the header says. 0xDD
             # with 0 s closes it; the pod is still playing, so the command
@@ -893,24 +1007,74 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device, sentences: l
         device.say_active = False
     if ok:
         status = "played"
+    elif stage == "delay_busy":
+        status = "busy"
     elif device.interrupted.is_set():
         status = "interrupted"
     else:
         status = "failed"
     duration = round(frames * frame_s, 2)
+    filler_duration = round(filler_frames * frame_s, 2)
+    answer_duration = round((frames - filler_frames) * frame_s, 2)
     elapsed = round(time.monotonic() - t0, 2)
-    say_mod.append_log(scfg.log_path, {
-        "device": device.hostname, "bot": bot, "voice": tts_voice,
-        "status": status, "duration_s": duration, "text": text,
-    })
-    if scfg.tell_agent and played:
-        said = text if ok else " ".join(sentences[:played])
-        say_mod.MEMORY.add(device.hostname, bot, said)
-    log.info(f"SAY   {status}: {played}/{len(sentences)} sentence(s), "
-             f"{duration:.2f}s of audio, {elapsed:.2f}s")
-    return {"status": status, "device": device.hostname, "bot": bot, "voice": tts_voice,
-            "sentences": len(sentences), "played": played,
-            "duration_s": duration, "elapsed_s": elapsed}
+
+    def _part_status(part_stage: str, part_played: int, part_total: int) -> str:
+        # A part that fully streamed is "played" even if a later stage
+        # (think / answer) was interrupted or failed.
+        if part_total and part_played == part_total:
+            return "played"
+        if status == "busy":
+            return "busy"
+        if part_played == 0 and stage != part_stage:
+            # Never reached this part (e.g. aborted in think before answer).
+            return status
+        return "interrupted" if device.interrupted.is_set() else "failed"
+
+    # Log each part that was reached. Filler lines carry filler=true so the
+    # agent (and Gilles) can tell them apart from the answer.
+    if filler_text and stage not in ("start", "delay", "delay_busy"):
+        say_mod.append_log(scfg.log_path, {
+            "device": device.hostname, "bot": bot, "voice": tts_voice,
+            "status": _part_status("filler", filler_played, len(filler_sentences)),
+            "duration_s": filler_duration, "text": filler_text, "filler": True,
+        })
+    if status == "busy":
+        say_mod.append_log(scfg.log_path, {
+            "device": device.hostname, "bot": bot, "voice": tts_voice,
+            "status": "busy", "duration_s": 0, "text": text,
+            "reason": "busy after delay",
+        })
+    elif stage not in ("start", "delay"):
+        say_mod.append_log(scfg.log_path, {
+            "device": device.hostname, "bot": bot, "voice": tts_voice,
+            "status": _part_status("answer", played, len(sentences)),
+            "duration_s": answer_duration, "text": text,
+        })
+    if scfg.tell_agent:
+        if filler_text and filler_played:
+            said_f = (filler_text if filler_played == len(filler_sentences)
+                      else " ".join(filler_sentences[:filler_played]))
+            say_mod.MEMORY.add(device.hostname, bot, said_f, filler=True)
+        if played:
+            said = (text if played == len(sentences)
+                    else " ".join(sentences[:played]))
+            say_mod.MEMORY.add(device.hostname, bot, said)
+    log.info(f"SAY   {status}: answer {played}/{len(sentences)}"
+             f"{f', filler {filler_played}/{len(filler_sentences)}' if filler_text else ''}"
+             f", {duration:.2f}s of audio, {elapsed:.2f}s")
+    result = {"status": status, "device": device.hostname, "bot": bot, "voice": tts_voice,
+              "sentences": len(sentences), "played": played,
+              "duration_s": duration, "elapsed_s": elapsed}
+    if filler_text is not None:
+        result["filler"] = filler_text
+        result["filler_sentences"] = len(filler_sentences)
+        result["filler_played"] = filler_played
+    if think_s:
+        result["think_s"] = think_s
+    if delay_s:
+        result["delay_s"] = delay_s
+        result["delayed"] = delayed
+    return result
 
 
 async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
@@ -933,24 +1097,43 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
     # Claim the pod. No await since the busy check, so nothing can slip in
     # between; processing also keeps the VAD from starting a voice turn
     # (mic frames during the say only feed barge-in, like during a reply).
+    # Claim covers delay_s too, so a second /say during the wait gets 409.
     device.say_active = True
     device.processing = True
     device.interrupted.clear()
     barge.new_turn()
     try:
         sentences = [s async for s in sentence_chunks(_one_delta(req["text"]))]
+        filler_sentences = []
+        if req["filler"]:
+            filler_sentences = [s async for s in sentence_chunks(_one_delta(req["filler"]))]
     except BaseException:
         device.processing = False
         device.say_active = False
         raise
-    task = asyncio.create_task(play_say(config, scfg, device, sentences, req["text"],
-                                        tts_voice, bot, listen=req["listen"]))
+    task = asyncio.create_task(play_say(
+        config, scfg, device, sentences, req["text"], tts_voice, bot,
+        listen=req["listen"], filler_sentences=filler_sentences,
+        filler_text=req["filler"], think_s=req["think_s"], delay_s=req["delay_s"],
+        barge=barge, utterance_queue=utterance_queue))
     if not req["wait"]:
         _say_tasks.add(task)
         task.add_done_callback(_say_tasks.discard)
-        return 200, {"status": "queued", "device": device.hostname, "bot": bot,
-                     "voice": tts_voice, "sentences": len(sentences)}
+        body_out = {"status": "queued", "device": device.hostname, "bot": bot,
+                    "voice": tts_voice, "sentences": len(sentences)}
+        if req["filler"]:
+            body_out["filler"] = req["filler"]
+            body_out["filler_sentences"] = len(filler_sentences)
+        if req["think_s"]:
+            body_out["think_s"] = req["think_s"]
+        if req["delay_s"]:
+            body_out["delay_s"] = req["delay_s"]
+        return 200, body_out
     result = await task
+    if result["status"] == "busy":
+        return 409, {"error": "busy", "reason": "busy after delay",
+                     "device": device.hostname, **{k: result[k] for k in
+                     ("bot", "voice", "delay_s") if k in result}}
     return (502 if result["status"] == "failed" else 200), result
 
 

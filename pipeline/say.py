@@ -12,12 +12,19 @@ HTTP server (main.py say_server), off unless the config enables it:
       tell_agent: true      # pass the text to the agent's next turn
 
 Request (JSON):
-    {"text": "...",            required
+    {"text": "...",            required (the answer)
      "voice": "robin",         agent name/alias, or a TTS voice ("tim-allen")
      "bot": "robin",           optional: whose history gets the text
      "device": "onju-1415E8",  optional: hostname or IP (default: last pod seen)
-     "listen": false,          optional: open the mic after it played
-     "wait": true}             optional: answer after it was sent (false = at once)
+     "listen": false,          optional: open the mic after the final answer
+     "wait": true,             optional: answer after it was sent (false = at once)
+     "filler": "...",          optional: short line before THINKING (same voice)
+     "think_s": 3,             optional: seconds of THINKING LEDs after filler
+     "delay_s": 5}             optional: wait before starting (re-check busy then)
+
+Staged sequence when filler and/or think_s is set: optional delay → filler →
+THINKING for think_s → answer. Plain announces (text only) are unchanged.
+listen applies only after the final answer; the mic stays closed between parts.
 
 Responses: 200 {"status": "played"|"queued"|"interrupted", "duration_s", ...}
 ("played" = all audio sent; the pod is still playing the last ~duration_s);
@@ -50,6 +57,11 @@ LISTEN_GRACE_S = 1.5
 # Says waiting for the agent's next turn are dropped after this long
 # (grok-bridge forgets a voice history after 1800 s idle, GROK_HISTORY_IDLE).
 MEMORY_TTL_S = 1800.0
+# Caps for the optional staged fields (filming). Firmware THINKING timeout
+# is 200 s; 30 s is plenty for a staged pause and keeps a stuck request
+# from holding the pod for minutes.
+MAX_THINK_S = 30.0
+MAX_DELAY_S = 120.0
 
 
 class SayError(Exception):
@@ -88,6 +100,34 @@ def check_token(scfg: SayConfig, headers: dict) -> None:
         raise SayError(401, {"error": "unauthorized"})
 
 
+def _opt_seconds(req: dict, key: str, cap: float) -> float:
+    """Optional non-negative seconds field, capped at `cap`. Missing/None/"" → 0."""
+    if key not in req or req[key] is None or req[key] == "":
+        return 0.0
+    v = req[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise SayError(400, {"error": f"\"{key}\" must be a number"})
+    v = float(v)
+    if v < 0:
+        raise SayError(400, {"error": f"\"{key}\" must be >= 0"})
+    return min(v, cap)
+
+
+def _opt_text(scfg: SayConfig, req: dict, key: str) -> str | None:
+    """Optional text field (same cleaning/length rules as \"text\"). Missing/blank → None."""
+    if key not in req or req[key] is None:
+        return None
+    v = req[key]
+    if not isinstance(v, str):
+        raise SayError(400, {"error": f"\"{key}\" must be a string"})
+    v = " ".join(v.split())
+    if not v:
+        return None
+    if len(v) > scfg.max_chars:
+        raise SayError(400, {"error": f"{key} longer than {scfg.max_chars} characters"})
+    return v
+
+
 def parse_request(scfg: SayConfig, body: bytes) -> dict:
     try:
         req = json.loads(body or b"{}")
@@ -111,6 +151,9 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
         "device": (req.get("device") or "").strip(),
         "listen": bool(req.get("listen", False)),
         "wait": bool(req.get("wait", True)),
+        "filler": _opt_text(scfg, req, "filler"),
+        "think_s": _opt_seconds(req, "think_s", MAX_THINK_S),
+        "delay_s": _opt_seconds(req, "delay_s", MAX_DELAY_S),
     }
 
 
@@ -177,7 +220,8 @@ def find_device(manager, name: str):
 
 # ---- busy check ----------------------------------------------------------
 
-def busy_reason(device, barge, queued: int = 0, now: float | None = None) -> str | None:
+def busy_reason(device, barge, queued: int = 0, now: float | None = None,
+                *, ignore_owned: bool = False) -> str | None:
     """Why the pod can't take a say right now, or None.
 
     - a say is already running on it;
@@ -185,12 +229,18 @@ def busy_reason(device, barge, queued: int = 0, now: float | None = None) -> str
     - the server estimates it is still playing audio (bargein.py);
     - it is recording (VAD has speech, or a PTT buffer is filling);
     - its mic is open (mic packets within LISTEN_GRACE_S): after a reply the
-      pod listens for default_mic_timeout s, after a tap for 20 s."""
+      pod listens for default_mic_timeout s, after a tap for 20 s.
+
+    ignore_owned: skip the say_active / processing checks. Used after a
+    staged delay_s, when this say already claimed the pod and is about to
+    start the filler/answer — still refuse if something else (mic, queue,
+    recording, leftover playback estimate) got in the way."""
     now = time.time() if now is None else now
-    if getattr(device, "say_active", False):
-        return "a say is already playing"
-    if getattr(device, "processing", False):
-        return "a voice turn is in progress"
+    if not ignore_owned:
+        if getattr(device, "say_active", False):
+            return "a say is already playing"
+        if getattr(device, "processing", False):
+            return "a voice turn is in progress"
     if queued:
         return "a voice turn is queued"
     if barge is not None and barge.is_playing():
@@ -208,7 +258,7 @@ def busy_reason(device, barge, queued: int = 0, now: float | None = None) -> str
 
 def append_log(path: str, entry: dict) -> None:
     """One JSON object per line (time, device, bot, voice, status,
-    duration_s, text). Never raises."""
+    duration_s, text; optional filler=true). Never raises."""
     try:
         d = os.path.dirname(path)
         if d:
@@ -234,20 +284,28 @@ class SayMemory:
 
     def __init__(self, ttl_s: float = MEMORY_TTL_S):
         self.ttl_s = ttl_s
-        self._said: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        # (when, text, is_filler)
+        self._said: dict[tuple[str, str], list[tuple[float, str, bool]]] = {}
 
-    def add(self, hostname: str, bot: str | None, text: str, now: float | None = None) -> None:
+    def add(self, hostname: str, bot: str | None, text: str,
+            now: float | None = None, *, filler: bool = False) -> None:
         now = time.monotonic() if now is None else now
-        self._said.setdefault((hostname, bot or ""), []).append((now, text))
+        self._said.setdefault((hostname, bot or ""), []).append((now, text, bool(filler)))
 
     def take(self, hostname: str, bot: str | None, now: float | None = None) -> str | None:
         """The note for this turn (and forget the says), or None."""
         now = time.monotonic() if now is None else now
         items = self._said.pop((hostname, bot or ""), [])
-        texts = [t for at, t in items if now - at <= self.ttl_s]
-        if not texts:
+        kept = [(t, filler) for at, t, filler in items if now - at <= self.ttl_s]
+        if not kept:
             return None
-        quoted = " ".join(f"\"{t}\"" for t in texts)
+        parts = []
+        for t, filler in kept:
+            if filler:
+                parts.append(f'(a short filler: "{t}")')
+            else:
+                parts.append(f'"{t}"')
+        quoted = " ".join(parts)
         return (f"(Note: before this, the user had the speaker say this aloud in your voice, "
                 f"as you: {quoted} Treat it as something you said.)")
 

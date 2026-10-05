@@ -18,7 +18,10 @@ main.py say_server / say_request / play_say):
   (once); listen=true keeps the mic open (last header carries the default
   mic timeout, no 0xDD); wait=false answers "queued" at once; an interrupt
   stops it (no 0xDD) and only the played sentences are remembered;
-- voice/bot resolution with named agents.
+- voice/bot resolution with named agents;
+- staged announce: optional filler + think_s + delay_s (THINKING held, mic
+  closed between parts, both lines in say.log / tell_agent; interrupt aborts
+  the rest; a second /say during the sequence gets 409).
 
 Reuses the stubs of tests/test_pause_flush.py. Run from the repo root:
 python3 tests/test_say.py
@@ -469,12 +472,167 @@ def test_resolve():
     check("resolve without agents: as is", say.resolve_voice(None, "x", "Y") == ("x", "y"))
 
 
+def test_parse_staged():
+    scfg = say.SayConfig({"enabled": True})
+    r = say.parse_request(scfg, b'{"text": "answer.", "filler": "  Let me look.  ", "think_s": 3, "delay_s": 5}')
+    check("parse: filler cleaned, think_s/delay_s kept",
+          r["text"] == "answer." and r["filler"] == "Let me look."
+          and r["think_s"] == 3.0 and r["delay_s"] == 5.0, r)
+    r = say.parse_request(scfg, b'{"text": "hi."}')
+    check("parse: plain request has no filler and zero think/delay",
+          r["filler"] is None and r["think_s"] == 0.0 and r["delay_s"] == 0.0, r)
+    r = say.parse_request(scfg, b'{"text": "hi.", "think_s": 100, "delay_s": 999}')
+    check("parse: think_s capped at 30, delay_s at 120",
+          r["think_s"] == say.MAX_THINK_S and r["delay_s"] == say.MAX_DELAY_S, r)
+    for bad in (b'{"text": "hi.", "think_s": -1}',
+                b'{"text": "hi.", "think_s": "x"}',
+                b'{"text": "hi.", "filler": 1}'):
+        try:
+            say.parse_request(scfg, bad)
+            check(f"parse: bad {bad} raises", False)
+        except say.SayError as e:
+            check(f"parse: bad {bad} -> 400", e.status == 400, e.body)
+    r = say.parse_request(scfg, b'{"text": "hi.", "filler": "   "}')
+    check("parse: blank filler is None", r["filler"] is None, r)
+
+
+async def test_staged():
+    """filler -> wait for play -> THINKING -> answer; delay; interrupt; busy."""
+    states = []
+
+    async with Env() as env:
+        # Record fire_state (THINKING) without touching the real pod wire.
+        real_fire = m.fire_state
+
+        def record_fire(ip, port, state):
+            states.append(state)
+            return real_fire(ip, port, state)
+
+        m.fire_state = record_fire
+        try:
+            text = f"{TAG} I do not know."
+            filler = f"{TAG} Let me look that up."
+            t0 = time.monotonic()
+            st, body = await http(env.port, "POST", "/say", {
+                "text": text, "voice": "pepper", "filler": filler, "think_s": 0.35,
+            })
+            elapsed = time.monotonic() - t0
+            await asyncio.sleep(0.2)
+            audio = env.pod.audio()
+            check("staged: 200 played, filler+answer both played",
+                  st == 200 and body["status"] == "played"
+                  and body["played"] == 1 and body["filler_played"] == 1
+                  and body.get("filler") == filler and body.get("think_s") == 0.35,
+                  f"{st} {body}")
+            check("staged: two audio connections (filler then answer), mic 0 on both",
+                  len(audio) == 2 and all(c["mic"] == 0 for c in audio), f"{env.pod.conns}")
+            check("staged: mic closed only after the answer (one 0xDD)",
+                  env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}], f"{env.pod.conns}")
+            check("staged: TTS got filler then answer in pepper's voice",
+                  [s for s, _ in env.tts.calls] == [filler, text]
+                  and all(v == "pepper" for _, v in env.tts.calls), f"{env.tts.calls}")
+            check("staged: THINKING fired at least once during the hold",
+                  states.count(2) >= 1, f"states={states}")
+            # Filler play wait uses bargein margin (~0.5s) + think_s.
+            check("staged: elapsed covers filler-play wait + think_s",
+                  elapsed >= 0.35, f"{elapsed:.2f}")
+            lines = env.log_lines()
+            check("staged: say.log has filler line then answer line",
+                  len(lines) == 2 and lines[0].get("filler") is True
+                  and lines[0]["text"] == filler and lines[0]["status"] == "played"
+                  and lines[1].get("filler") is None and lines[1]["text"] == text
+                  and lines[1]["status"] == "played", f"{lines}")
+            note = say.MEMORY.take(env.devices[0].hostname, "pepper")
+            check("staged: tell_agent note marks the filler and includes the answer",
+                  note is not None and "short filler" in note and "Let me look" in note
+                  and "I do not know" in note, note)
+        finally:
+            m.fire_state = real_fire
+
+    # delay_s: claims immediately (second /say -> 409), then speaks.
+    async with Env() as env:
+        env.tts.delay = 0.05
+        started = asyncio.Event()
+        done = asyncio.Event()
+
+        async def delayed():
+            started.set()
+            return await http(env.port, "POST", "/say", {
+                "text": f"{TAG} after delay.", "voice": "data", "delay_s": 0.4,
+            })
+
+        task = asyncio.create_task(delayed())
+        await started.wait()
+        await asyncio.sleep(0.05)
+        st2, body2 = await http(env.port, "POST", "/say", {"text": f"{TAG} no."})
+        check("delay: second /say during delay is 409 busy",
+              st2 == 409 and "say" in body2["reason"], f"{st2} {body2}")
+        st, body = await task
+        check("delay: first say plays after delay_s",
+              st == 200 and body["status"] == "played" and body.get("delay_s") == 0.4
+              and body.get("delayed") is True, f"{st} {body}")
+
+    # Interrupt during THINKING: filler was played, answer never starts.
+    async with Env() as env:
+        states.clear()
+        real_fire = m.fire_state
+
+        def record_fire(ip, port, state):
+            states.append(state)
+            # Trip the interrupt the first time THINKING is requested.
+            if state == 2:
+                env.devices[0].interrupted.set()
+            return real_fire(ip, port, state)
+
+        m.fire_state = record_fire
+        try:
+            st, body = await http(env.port, "POST", "/say", {
+                "text": f"{TAG} answer never.", "voice": "robin",
+                "filler": f"{TAG} looking.", "think_s": 2.0,
+            })
+            await asyncio.sleep(0.2)
+            check("interrupt-in-think: status interrupted, answer not played",
+                  st == 200 and body["status"] == "interrupted"
+                  and body["played"] == 0 and body["filler_played"] == 1,
+                  f"{st} {body}")
+            check("interrupt-in-think: only filler audio, no 0xDD (aborted)",
+                  len(env.pod.audio()) == 1 and not env.pod.mic_cmds(),
+                  f"{env.pod.conns}")
+            check("interrupt-in-think: pod released",
+                  not env.devices[0].processing and not env.devices[0].say_active)
+            lines = env.log_lines()
+            check("interrupt-in-think: filler logged played, answer interrupted",
+                  len(lines) == 2 and lines[0].get("filler") and lines[0]["status"] == "played"
+                  and lines[1]["status"] == "interrupted" and not lines[1].get("filler"),
+                  f"{lines}")
+            note = say.MEMORY.take(env.devices[0].hostname, "robin")
+            check("interrupt-in-think: only the filler is remembered",
+                  note is not None and "looking" in note and "answer never" not in note, note)
+        finally:
+            m.fire_state = real_fire
+
+    # listen=true on a staged say: only the answer opens the mic.
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say", {
+            "text": f"{TAG} final.", "voice": "pepper",
+            "filler": f"{TAG} hold on.", "think_s": 0.2, "listen": True,
+        })
+        await asyncio.sleep(0.2)
+        mics = [c["mic"] for c in env.pod.audio()]
+        check("staged+listen: filler mic 0, answer opens mic, no 0xDD",
+              st == 200 and mics == [0, MIC] and not env.pod.mic_cmds(),
+              f"{st} {mics} {env.pod.conns}")
+
+
+
 async def main():
     await test_disabled()
     await test_refusals()
     await test_happy()
+    await test_staged()
     await test_turn_note()
     test_resolve()
+    test_parse_staged()
     for f in glob.glob(f"/tmp/tts-debug/*_{TAG}*.wav"):
         os.remove(f)
     total = len(pf.CHECKS)
