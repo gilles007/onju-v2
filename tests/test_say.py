@@ -470,6 +470,21 @@ def test_resolve():
         got = say.resolve_voice(r, voice, bot)
         check(f"resolve voice={voice!r} bot={bot!r} -> {want}", got == want, f"{got}")
     check("resolve without agents: as is", say.resolve_voice(None, "x", "Y") == ("x", "y"))
+    # raw_voice: the name is a TTS voice even when an agent has that name
+    raw_cases = [
+        (("data", ""), ("data", None)),                  # voice "data", not agent data
+        (("jack-nicholson", ""), ("jack-nicholson", "data")),  # agent with that voice
+        (("tim-allen", ""), ("tim-allen", "robin")),
+        (("data", "data"), ("data", "data")),            # bot given: it owns the line
+        (("Tim", ""), ("Tim", None)),                    # alias not resolved when raw
+    ]
+    for (voice, bot), want in raw_cases:
+        got = say.resolve_voice(r, voice, bot, raw=True)
+        check(f"resolve raw voice={voice!r} bot={bot!r} -> {want}", got == want, f"{got}")
+    p = say.parse_request(say.SayConfig({"enabled": True}), b'{"text": "hi", "voice": "data", "raw_voice": true}')
+    check("parse: raw_voice kept", p["raw_voice"] is True, p)
+    p = say.parse_request(say.SayConfig({"enabled": True}), b'{"text": "hi"}')
+    check("parse: raw_voice defaults to false", p["raw_voice"] is False, p)
 
 
 def test_parse_staged():

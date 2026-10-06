@@ -14,6 +14,7 @@ HTTP server (main.py say_server), off unless the config enables it:
 Request (JSON):
     {"text": "...",            required (the answer)
      "voice": "robin",         agent name/alias, or a TTS voice ("tim-allen")
+     "raw_voice": false,       optional: "voice" is a TTS voice name, never an agent
      "bot": "robin",           optional: whose history gets the text
      "device": "onju-1415E8",  optional: hostname or IP (default: last pod seen)
      "listen": false,          optional: open the mic after the final answer
@@ -154,17 +155,25 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
         "filler": _opt_text(scfg, req, "filler"),
         "think_s": _opt_seconds(req, "think_s", MAX_THINK_S),
         "delay_s": _opt_seconds(req, "delay_s", MAX_DELAY_S),
+        "raw_voice": bool(req.get("raw_voice", False)),
     }
 
 
-def resolve_voice(router, voice: str, bot: str) -> tuple[str | None, str | None]:
+def resolve_voice(router, voice: str, bot: str,
+                  raw: bool = False) -> tuple[str | None, str | None]:
     """(TTS voice or None = configured default, bot or None) for a request.
 
     With named agents (router): `voice` may be an agent name or alias (its
     voice is used) or a TTS voice name (the agent with that voice, if any,
     is the bot). `bot`, if given, must be an agent; it wins for the history,
     and gives the voice when `voice` is empty. Without agents, `voice` is
-    passed to the TTS as is and `bot` is only recorded."""
+    passed to the TTS as is and `bot` is only recorded.
+
+    `raw` (request "raw_voice": true): `voice` is always a TTS voice name and
+    is never looked up as an agent name/alias. Needed when a voice and an
+    agent share a name: voice "data" (the old Data clip) vs agent "data"
+    (jack-nicholson). The bot is still `bot`, else the agent whose configured
+    voice is exactly that name, else none (played and logged, no agent told)."""
     if router is None:
         return (voice or None), (bot.lower() or None)
     agent_bot = None
@@ -180,7 +189,7 @@ def resolve_voice(router, voice: str, bot: str) -> tuple[str | None, str | None]
     tts_voice = None
     voice_bot = None
     if voice:
-        hit = _agent_by_name(router, voice.lower())
+        hit = None if raw else _agent_by_name(router, voice.lower())
         if hit is not None:
             voice_bot = hit
             tts_voice = router.voice_for(hit)

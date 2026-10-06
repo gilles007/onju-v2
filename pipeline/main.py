@@ -1083,7 +1083,8 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
     """POST /say. Returns (HTTP status, JSON body); SayError for refusals."""
     say_mod.check_token(scfg, headers)
     req = say_mod.parse_request(scfg, body)
-    tts_voice, bot = say_mod.resolve_voice(router, req["voice"], req["bot"])
+    tts_voice, bot = say_mod.resolve_voice(router, req["voice"], req["bot"],
+                                             raw=req["raw_voice"])
     device = say_mod.find_device(manager, req["device"])
     if device is None:
         raise say_mod.SayError(404, {"error": "unknown pod" if req["device"] else "no pod known yet",
