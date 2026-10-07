@@ -13,11 +13,12 @@ import numpy as np
 import yaml
 
 from pipeline import bargein
+from pipeline import say as say_mod
 from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, OpusStreamEncoder
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection
+from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, send_stop_listening
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
 
         now = time.time()
         last_packet_time[device.hostname] = now
+        device.last_mic_at = now   # mic open: the say endpoint counts it as busy
         pcm = decode_ulaw(data)
 
         if device.ptt:
@@ -240,6 +242,167 @@ async def multicast_listener(config: dict, manager: DeviceManager):
         await greet_device(device, config)
 
 
+async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool,
+                          turn_t0: float, tts_kwargs: dict | None = None,
+                          mic_timeout: int | None = None) -> tuple[bool, int]:
+    """Synthesize, encode, and stream one sentence over a single
+    TCP connection. Opus frames are written as the TTS produces
+    audio; closing the connection signals end-of-segment to the pod.
+
+    Returns (ok, frames sent). ok is False when the sentence was cut short
+    (interrupt, TTS error, pod connection failed): the caller stops there.
+    Used by a voice turn (process_utterances, through its send_sentence)
+    and by the say endpoint (say_server). mic_timeout: the header's mic
+    timeout; None = default_mic_timeout for a final sentence, else 0."""
+    tcp_port = config["network"]["tcp_port"]
+    dev_cfg = config["device"]
+    sample_rate = config["audio"]["sample_rate"]
+    opus_frame_size = config["audio"]["opus_frame_size"]
+    tts_kwargs = tts_kwargs or {}
+    if device.interrupted.is_set():
+        log.info(f"Interrupted before TTS")
+        return False, 0
+
+    enc = OpusStreamEncoder(sample_rate, opus_frame_size)
+    batch_pcm = b""
+    batch_min = sample_rate * 2 // 2          # ~0.5s of s16 mono
+    n_frames = 0
+    t_first = None
+    _dbg_pcm = b""
+    max_audio_bytes = config["audio"]["sample_rate"] * 2 * 45  # 45s hard cap
+
+    if mic_timeout is None:
+        mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
+    barge = bargein.for_device(device, config)
+    frame_s = opus_frame_size / sample_rate
+
+    # The pod connection is opened only when the first audio is
+    # ready to write (first batch, or the end of the sentence),
+    # not before the TTS call (2026-10-01, Ruby). Once the pod
+    # has read the 6-byte header it waits at most 2 s for the
+    # first Opus frame ("Opus task: TCP stalled waiting for frame
+    # length", onjuino.ino), then closes the connection and plays
+    # nothing. Whole-sentence TTS (backend local with Qwen) takes
+    # 2-3 s, so with the connection opened first every sentence
+    # but the shortest was lost, while the server still logged it
+    # as sent. Still one connection per sentence (28134ec).
+    writer = None
+    seg_start = 0.0
+    open_failed = False
+    cancelled = False
+    lost_warned = False
+
+    async def open_pod() -> bool:
+        nonlocal writer, seg_start, open_failed
+        writer = await open_audio_connection(
+            device.ip, tcp_port,
+            mic_timeout=mic_timeout,
+            volume=dev_cfg["default_volume"],
+            fade=dev_cfg["led_fade"])
+        if writer is None:
+            open_failed = True
+            log.error(f"Failed to open audio connection to {device.ip}")
+            return False
+        # Playback estimate for VOX barge-in: this sentence starts
+        # playing when the previous one has finished (or now), and
+        # lasts as long as the audio sent so far (+ a margin, see
+        # pipeline/bargein.py). Updated after every batch of frames.
+        seg_start = barge.start_segment()
+        return True
+
+    def pod_closed() -> bool:
+        """The pod closed its end (e.g. its 2 s frame timeout):
+        frames written now are lost. Warned once per sentence."""
+        nonlocal lost_warned
+        reader = getattr(writer, "pod_reader", None)
+        if lost_warned or reader is None or not reader.at_eof():
+            return False
+        lost_warned = True
+        log.warning(f"Pod {device.ip} closed the audio connection after "
+                    f"{n_frames} frames; the rest of {sentence!r} is lost "
+                    f"(pod waits at most 2 s for each frame)")
+        return True
+
+    try:
+        async for pcm in tts.synthesize_stream(
+                sentence, device.voice, config, **tts_kwargs):
+            if device.interrupted.is_set():
+                log.info(f"Interrupted mid-stream "
+                         f"({n_frames} frames sent)")
+                return False, n_frames
+            if t_first is None:
+                t_first = time.monotonic() - turn_t0
+            _dbg_pcm += pcm
+            # Detect possible TTS hallucination, and stop it before it becomes long babble
+            if len(_dbg_pcm) > max_audio_bytes:
+                log.warning(f"TTS runaway detected (audio len exceeds longest expected utterance)");
+                break;
+            batch_pcm += pcm
+            ### 20261124, I'm still getting TTS Hallucination (due to short sentences?)
+            ### Comment 7 lines below to send one sentence at a time? (I don't think it's networks stack related, but try)
+            if len(batch_pcm) >= batch_min:
+                frames = enc.encode_chunk(batch_pcm)
+                if writer is None and not await open_pod():
+                    return False, n_frames
+                pod_closed()
+                if frames and not write_audio_frames(writer, frames):
+                    log.error(f"Connection lost mid-stream to {device.ip}")
+                    return False, n_frames
+                await writer.drain()
+                n_frames += len(frames)
+                barge.audio_sent(seg_start, n_frames * frame_s)
+                batch_pcm = b""
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    except Exception as e:
+        log.error(f"TTS  failed: {e}")
+        return False, n_frames
+    finally:
+        # Always close — even on error/interrupt, so the pod
+        # gets EOF and doesn't hang waiting for more frames.
+        tail = enc.encode_chunk(batch_pcm) + enc.flush()
+        if writer is None and not (open_failed or cancelled):
+            if device.interrupted.is_set():
+                # Interrupted before any audio: nothing to play,
+                # and a header now would stop the pod's mic
+                # while the user is talking over us.
+                log.info(f"Interrupted before the first audio; "
+                         f"no connection opened for {sentence!r}")
+            else:
+                # Short sentence (under one batch), no audio at
+                # all, runaway in a single chunk, or a TTS error:
+                # the pod still gets the header (mic timeout)
+                # and end-of-segment, as before.
+                await open_pod()
+        if writer is not None:
+            if tail:
+                pod_closed()
+                write_audio_frames(writer, tail)
+                n_frames += len(tail)
+            await close_audio_connection(writer)
+            barge.audio_sent(seg_start, n_frames * frame_s)
+
+    log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
+             f"tts_first[{f'+{t_first:.2f}s' if t_first is not None else 'no audio'}] "
+             f"{n_frames} frames "
+             f"to {device.ip} "
+             f"({'final' if is_final else 'partial'}: {sentence!r})")
+
+    # Debug dump
+    import pathlib, wave as _wave
+    _dbg_dir = pathlib.Path("/tmp/tts-debug")
+    _dbg_dir.mkdir(exist_ok=True)
+    _dbg_path = _dbg_dir / f"{int(time.time())}_{sentence[:20].replace(' ','_')}.wav"
+    with _wave.open(str(_dbg_path), "wb") as _w:
+        _w.setnchannels(1); _w.setsampwidth(2)
+        _w.setframerate(config["audio"]["sample_rate"])
+        _w.writeframes(_dbg_pcm)
+    log.info(f"DEBUG  saved {len(_dbg_pcm)}B -> {_dbg_path}")
+
+    return True, n_frames
+
+
 async def process_utterances(config: dict, manager: DeviceManager, utterance_queue: asyncio.Queue):
     """Process complete utterances: ASR -> Conversation -> TTS -> Opus -> TCP."""
     tcp_port = config["network"]["tcp_port"]
@@ -309,154 +472,13 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
 
             async def send_sentence(sentence: str, is_final: bool) -> bool:
-                """Synthesize, encode, and stream one sentence over a single
-                TCP connection. Opus frames are written as the TTS produces
-                audio; closing the connection signals end-of-segment to the pod."""
+                """One sentence of this turn (see stream_sentence)."""
                 nonlocal sent_partial
-                if device.interrupted.is_set():
-                    log.info(f"Interrupted before TTS")
-                    return False
-
-                enc = OpusStreamEncoder(sample_rate, opus_frame_size)
-                batch_pcm = b""
-                batch_min = sample_rate * 2 // 2          # ~0.5s of s16 mono
-                n_frames = 0
-                t_first = None
-                _dbg_pcm = b""
-                max_audio_bytes = config["audio"]["sample_rate"] * 2 * 45  # 45s hard cap
-
-                mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
-                barge = bargein.for_device(device, config)
-                frame_s = opus_frame_size / sample_rate
-
-                # The pod connection is opened only when the first audio is
-                # ready to write (first batch, or the end of the sentence),
-                # not before the TTS call (2026-10-01, Ruby). Once the pod
-                # has read the 6-byte header it waits at most 2 s for the
-                # first Opus frame ("Opus task: TCP stalled waiting for frame
-                # length", onjuino.ino), then closes the connection and plays
-                # nothing. Whole-sentence TTS (backend local with Qwen) takes
-                # 2-3 s, so with the connection opened first every sentence
-                # but the shortest was lost, while the server still logged it
-                # as sent. Still one connection per sentence (28134ec).
-                writer = None
-                seg_start = 0.0
-                open_failed = False
-                cancelled = False
-                lost_warned = False
-
-                async def open_pod() -> bool:
-                    nonlocal writer, seg_start, open_failed
-                    writer = await open_audio_connection(
-                        device.ip, tcp_port,
-                        mic_timeout=mic_timeout,
-                        volume=dev_cfg["default_volume"],
-                        fade=dev_cfg["led_fade"])
-                    if writer is None:
-                        open_failed = True
-                        log.error(f"Failed to open audio connection to {device.ip}")
-                        return False
-                    # Playback estimate for VOX barge-in: this sentence starts
-                    # playing when the previous one has finished (or now), and
-                    # lasts as long as the audio sent so far (+ a margin, see
-                    # pipeline/bargein.py). Updated after every batch of frames.
-                    seg_start = barge.start_segment()
-                    return True
-
-                def pod_closed() -> bool:
-                    """The pod closed its end (e.g. its 2 s frame timeout):
-                    frames written now are lost. Warned once per sentence."""
-                    nonlocal lost_warned
-                    reader = getattr(writer, "pod_reader", None)
-                    if lost_warned or reader is None or not reader.at_eof():
-                        return False
-                    lost_warned = True
-                    log.warning(f"Pod {device.ip} closed the audio connection after "
-                                f"{n_frames} frames; the rest of {sentence!r} is lost "
-                                f"(pod waits at most 2 s for each frame)")
-                    return True
-
-                try:
-                    async for pcm in tts.synthesize_stream(
-                            sentence, device.voice, config):
-                        if device.interrupted.is_set():
-                            log.info(f"Interrupted mid-stream "
-                                     f"({n_frames} frames sent)")
-                            return False
-                        if t_first is None:
-                            t_first = time.monotonic() - turn_t0
-                        _dbg_pcm += pcm
-                        # Detect possible TTS hallucination, and stop it before it becomes long babble
-                        if len(_dbg_pcm) > max_audio_bytes:
-                            log.warning(f"TTS runaway detected (audio len exceeds longest expected utterance)");
-                            break;
-                        batch_pcm += pcm
-                        ### 20261124, I'm still getting TTS Hallucination (due to short sentences?)
-                        ### Comment 7 lines below to send one sentence at a time? (I don't think it's networks stack related, but try)
-                        if len(batch_pcm) >= batch_min:
-                            frames = enc.encode_chunk(batch_pcm)
-                            if writer is None and not await open_pod():
-                                return False
-                            pod_closed()
-                            if frames and not write_audio_frames(writer, frames):
-                                log.error(f"Connection lost mid-stream to {device.ip}")
-                                return False
-                            await writer.drain()
-                            n_frames += len(frames)
-                            barge.audio_sent(seg_start, n_frames * frame_s)
-                            batch_pcm = b""
-                except asyncio.CancelledError:
-                    cancelled = True
-                    raise
-                except Exception as e:
-                    log.error(f"TTS  failed: {e}")
-                    return False
-                finally:
-                    # Always close — even on error/interrupt, so the pod
-                    # gets EOF and doesn't hang waiting for more frames.
-                    tail = enc.encode_chunk(batch_pcm) + enc.flush()
-                    if writer is None and not (open_failed or cancelled):
-                        if device.interrupted.is_set():
-                            # Interrupted before any audio: nothing to play,
-                            # and a header now would stop the pod's mic
-                            # while the user is talking over us.
-                            log.info(f"Interrupted before the first audio; "
-                                     f"no connection opened for {sentence!r}")
-                        else:
-                            # Short sentence (under one batch), no audio at
-                            # all, runaway in a single chunk, or a TTS error:
-                            # the pod still gets the header (mic timeout)
-                            # and end-of-segment, as before.
-                            await open_pod()
-                    if writer is not None:
-                        if tail:
-                            pod_closed()
-                            write_audio_frames(writer, tail)
-                            n_frames += len(tail)
-                        await close_audio_connection(writer)
-                        barge.audio_sent(seg_start, n_frames * frame_s)
-
-                if not is_final:
+                ok, _ = await stream_sentence(config, device, sentence, is_final=is_final,
+                                              turn_t0=turn_t0)
+                if ok and not is_final:
                     sent_partial = True
-
-                log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
-                         f"tts_first[{f'+{t_first:.2f}s' if t_first is not None else 'no audio'}] "
-                         f"{n_frames} frames "
-                         f"to {device.ip} "
-                         f"({'final' if is_final else 'partial'}: {sentence!r})")
-
-                # Debug dump
-                import pathlib, wave as _wave
-                _dbg_dir = pathlib.Path("/tmp/tts-debug")
-                _dbg_dir.mkdir(exist_ok=True)
-                _dbg_path = _dbg_dir / f"{int(time.time())}_{sentence[:20].replace(' ','_')}.wav"
-                with _wave.open(str(_dbg_path), "wb") as _w:
-                    _w.setnchannels(1); _w.setsampwidth(2)
-                    _w.setframerate(config["audio"]["sample_rate"])
-                    _w.writeframes(_dbg_pcm)
-                log.info(f"DEBUG  saved {len(_dbg_pcm)}B -> {_dbg_path}")
-
-                return True
+                return ok
 
 
 
@@ -782,6 +804,390 @@ def _http_respond(writer: asyncio.StreamWriter, status: int, body: str):
     writer.write(f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode())
 
 
+# ---- say endpoint (pipeline/say.py) ----------------------------------------
+
+async def _one_delta(text: str):
+    yield text + " "
+
+
+# How often to re-send STATE_THINKING while a staged say holds the LEDs.
+# Firmware THINKING_TIMEOUT_MS is 200 s, so a single send covers think_s
+# (capped at 30); refreshing matches how a normal turn re-arms THINKING
+# after a stall line / pause-flush (SPEAKING would otherwise leave IDLE).
+THINK_REFRESH_S = 10.0
+
+
+async def _say_sleep(device, seconds: float) -> bool:
+    """Sleep up to `seconds`. Returns False if the pod was interrupted."""
+    if seconds <= 0:
+        return not device.interrupted.is_set()
+    end = time.monotonic() + seconds
+    while True:
+        if device.interrupted.is_set():
+            return False
+        left = end - time.monotonic()
+        if left <= 0:
+            return True
+        await asyncio.sleep(min(0.05, left))
+
+
+async def _say_wait_playback(device, barge) -> bool:
+    """Wait until barge-in estimates the pod has finished playing.
+    Returns False if interrupted. Accuracy is the playback estimate
+    (audio sent + PLAYBACK_MARGIN_S); the pod does not report end-of-play."""
+    while barge.is_playing():
+        if device.interrupted.is_set():
+            return False
+        left = barge.playing_until - time.monotonic()
+        await asyncio.sleep(min(0.05, max(0.0, left)))
+    return not device.interrupted.is_set()
+
+
+async def _say_hold_thinking(config: dict, device, think_s: float) -> bool:
+    """Hold STATE_THINKING for think_s (re-send every THINK_REFRESH_S).
+    Returns False if interrupted. Speaking LEDs take over when the answer
+    audio connection opens (firmware sets VS_SPEAKING on 0xAA)."""
+    if think_s <= 0:
+        return not device.interrupted.is_set()
+    tcp_port = config["network"]["tcp_port"]
+    fire_state(device.ip, tcp_port, STATE_THINKING)
+    end = time.monotonic() + think_s
+    next_refresh = time.monotonic() + THINK_REFRESH_S
+    while True:
+        if device.interrupted.is_set():
+            return False
+        now = time.monotonic()
+        if now >= end:
+            return True
+        if now >= next_refresh:
+            fire_state(device.ip, tcp_port, STATE_THINKING)
+            next_refresh = now + THINK_REFRESH_S
+        await asyncio.sleep(min(0.05, end - now, max(0.0, next_refresh - now)))
+
+
+async def _say_stream_part(config: dict, device, sentences: list[str], *,
+                           t0: float, tts_kwargs: dict, listen: bool) -> tuple[bool, int, int]:
+    """Stream sentences; listen only on the last if listen. Returns
+    (ok, frames, played_count)."""
+    frames = 0
+    played = 0
+    ok = True
+    for i, sentence in enumerate(sentences):
+        last = i == len(sentences) - 1
+        mic = config["device"]["default_mic_timeout"] if (last and listen) else 0
+        ok, n = await stream_sentence(config, device, sentence, is_final=last,
+                                      turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic)
+        frames += n
+        if not ok:
+            break
+        played += 1
+    return ok, frames, played
+
+
+async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
+                   sentences: list[str], text: str, tts_voice: str | None,
+                   bot: str | None, listen: bool = False,
+                   filler_sentences: list[str] | None = None,
+                   filler_text: str | None = None,
+                   think_s: float = 0.0, delay_s: float = 0.0,
+                   barge=None, utterance_queue: asyncio.Queue | None = None) -> dict:
+    """Play a say on a pod already claimed by say_request (say_active and
+    processing set). Same path as a voice turn: stream_sentence() per
+    sentence, so the speaking LEDs, barge-in estimate, SEND lines and debug
+    WAVs all apply.
+
+    Optional staging (all no-ops when unset, so plain announces are
+    unchanged): delay_s → filler (mic closed) → wait for filler playback →
+    STATE_THINKING for think_s → answer. listen applies only to the final
+    answer sentence; between parts the mic stays closed (mic_timeout 0,
+    and 0xDD only after the answer when listen is false)."""
+    tcp_port = config["network"]["tcp_port"]
+    frame_s = config["audio"]["opus_frame_size"] / config["audio"]["sample_rate"]
+    t0 = time.monotonic()
+    tts_kwargs = {"voice_override": tts_voice} if tts_voice else {}
+    if barge is None:
+        barge = bargein.for_device(device, config)
+    filler_sentences = filler_sentences or []
+    frames = 0
+    played = 0
+    filler_frames = 0
+    filler_played = 0
+    ok = True
+    stage = "start"
+    delayed = False
+    log.info(f"SAY   {device.hostname} voice={tts_voice or 'tts default'} bot={bot or '-'} "
+             f"{len(sentences)} sentence(s)"
+             f"{f', filler={filler_text!r}' if filler_text else ''}"
+             f"{f', think_s={think_s:g}' if think_s else ''}"
+             f"{f', delay_s={delay_s:g}' if delay_s else ''}"
+             f": {text!r}")
+    try:
+        if delay_s > 0:
+            stage = "delay"
+            if not await _say_sleep(device, delay_s):
+                ok = False
+            else:
+                delayed = True
+                queued = utterance_queue.qsize() if utterance_queue is not None else 0
+                reason = say_mod.busy_reason(device, barge, queued, ignore_owned=True)
+                if reason:
+                    log.info(f"SAY   aborted after delay on {device.hostname}: {reason}")
+                    ok = False
+                    stage = "delay_busy"
+        if ok and filler_sentences:
+            stage = "filler"
+            ok, n, filler_played = await _say_stream_part(
+                config, device, filler_sentences, t0=t0, tts_kwargs=tts_kwargs, listen=False)
+            filler_frames = n
+            frames += n
+            if ok and not await _say_wait_playback(device, barge):
+                ok = False
+        if ok and think_s > 0:
+            stage = "think"
+            if not await _say_hold_thinking(config, device, think_s):
+                ok = False
+        if ok and sentences:
+            stage = "answer"
+            # Final part of a multi-stage say, or the only part of a plain one.
+            ok, n, played = await _say_stream_part(
+                config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen)
+            frames += n
+        if ok and not listen and not device.ptt and (played or filler_played):
+            # The pod opens its mic for at least 20 s after every playback
+            # (MIC_LISTEN_MS in onjuino.ino), whatever the header says. 0xDD
+            # with 0 s closes it; the pod is still playing, so the command
+            # waits in its TCP backlog and applies right after playback.
+            await send_stop_listening(device.ip, tcp_port, 0)
+    finally:
+        device.processing = False
+        device.say_active = False
+    if ok:
+        status = "played"
+    elif stage == "delay_busy":
+        status = "busy"
+    elif device.interrupted.is_set():
+        status = "interrupted"
+    else:
+        status = "failed"
+    duration = round(frames * frame_s, 2)
+    filler_duration = round(filler_frames * frame_s, 2)
+    answer_duration = round((frames - filler_frames) * frame_s, 2)
+    elapsed = round(time.monotonic() - t0, 2)
+
+    def _part_status(part_stage: str, part_played: int, part_total: int) -> str:
+        # A part that fully streamed is "played" even if a later stage
+        # (think / answer) was interrupted or failed.
+        if part_total and part_played == part_total:
+            return "played"
+        if status == "busy":
+            return "busy"
+        if part_played == 0 and stage != part_stage:
+            # Never reached this part (e.g. aborted in think before answer).
+            return status
+        return "interrupted" if device.interrupted.is_set() else "failed"
+
+    # Log each part that was reached. Filler lines carry filler=true so the
+    # agent (and Gilles) can tell them apart from the answer.
+    if filler_text and stage not in ("start", "delay", "delay_busy"):
+        say_mod.append_log(scfg.log_path, {
+            "device": device.hostname, "bot": bot, "voice": tts_voice,
+            "status": _part_status("filler", filler_played, len(filler_sentences)),
+            "duration_s": filler_duration, "text": filler_text, "filler": True,
+        })
+    if status == "busy":
+        say_mod.append_log(scfg.log_path, {
+            "device": device.hostname, "bot": bot, "voice": tts_voice,
+            "status": "busy", "duration_s": 0, "text": text,
+            "reason": "busy after delay",
+        })
+    elif stage not in ("start", "delay"):
+        say_mod.append_log(scfg.log_path, {
+            "device": device.hostname, "bot": bot, "voice": tts_voice,
+            "status": _part_status("answer", played, len(sentences)),
+            "duration_s": answer_duration, "text": text,
+        })
+    # Not passed to the agent (no tell_agent on hermes-voice): the say log
+    # above is the only record. See pipeline/say.py.
+    log.info(f"SAY   {status}: answer {played}/{len(sentences)}"
+             f"{f', filler {filler_played}/{len(filler_sentences)}' if filler_text else ''}"
+             f", {duration:.2f}s of audio, {elapsed:.2f}s")
+    result = {"status": status, "device": device.hostname, "bot": bot, "voice": tts_voice,
+              "sentences": len(sentences), "played": played,
+              "duration_s": duration, "elapsed_s": elapsed}
+    if filler_text is not None:
+        result["filler"] = filler_text
+        result["filler_sentences"] = len(filler_sentences)
+        result["filler_played"] = filler_played
+    if think_s:
+        result["think_s"] = think_s
+    if delay_s:
+        result["delay_s"] = delay_s
+        result["delayed"] = delayed
+    return result
+
+
+async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
+                      utterance_queue: asyncio.Queue | None,
+                      headers: dict, body: bytes) -> tuple[int, dict]:
+    """POST /say. Returns (HTTP status, JSON body); SayError for refusals."""
+    say_mod.check_token(scfg, headers)
+    req = say_mod.parse_request(scfg, body)
+    tts_voice, bot = say_mod.resolve_voice(router, req["voice"], req["bot"],
+                                             raw=req["raw_voice"])
+    device = say_mod.find_device(manager, req["device"])
+    if device is None:
+        raise say_mod.SayError(404, {"error": "unknown pod" if req["device"] else "no pod known yet",
+                                     "device": req["device"] or None})
+    barge = bargein.for_device(device, config)
+    queued = utterance_queue.qsize() if utterance_queue is not None else 0
+    reason = say_mod.busy_reason(device, barge, queued)
+    if reason:
+        log.info(f"SAY   refused for {device.hostname}: {reason}")
+        raise say_mod.SayError(409, {"error": "busy", "reason": reason, "device": device.hostname})
+    # Claim the pod. No await since the busy check, so nothing can slip in
+    # between; processing also keeps the VAD from starting a voice turn
+    # (mic frames during the say only feed barge-in, like during a reply).
+    # Claim covers delay_s too, so a second /say during the wait gets 409.
+    device.say_active = True
+    device.processing = True
+    device.interrupted.clear()
+    barge.new_turn()
+    try:
+        sentences = [s async for s in sentence_chunks(_one_delta(req["text"]))]
+        filler_sentences = []
+        if req["filler"]:
+            filler_sentences = [s async for s in sentence_chunks(_one_delta(req["filler"]))]
+    except BaseException:
+        device.processing = False
+        device.say_active = False
+        raise
+    task = asyncio.create_task(play_say(
+        config, scfg, device, sentences, req["text"], tts_voice, bot,
+        listen=req["listen"], filler_sentences=filler_sentences,
+        filler_text=req["filler"], think_s=req["think_s"], delay_s=req["delay_s"],
+        barge=barge, utterance_queue=utterance_queue))
+    if not req["wait"]:
+        _say_tasks.add(task)
+        task.add_done_callback(_say_tasks.discard)
+        body_out = {"status": "queued", "device": device.hostname, "bot": bot,
+                    "voice": tts_voice, "sentences": len(sentences)}
+        if req["filler"]:
+            body_out["filler"] = req["filler"]
+            body_out["filler_sentences"] = len(filler_sentences)
+        if req["think_s"]:
+            body_out["think_s"] = req["think_s"]
+        if req["delay_s"]:
+            body_out["delay_s"] = req["delay_s"]
+        return 200, body_out
+    result = await task
+    if result["status"] == "busy":
+        return 409, {"error": "busy", "reason": "busy after delay",
+                     "device": device.hostname, **{k: result[k] for k in
+                     ("bot", "voice", "delay_s") if k in result}}
+    return (502 if result["status"] == "failed" else 200), result
+
+
+_say_tasks: set[asyncio.Task] = set()   # strong refs for wait=false says
+
+
+def say_status(config: dict, manager, utterance_queue, router) -> dict:
+    """GET /say: known pods and whether each could take a say now."""
+    queued = utterance_queue.qsize() if utterance_queue is not None else 0
+    devices = {}
+    for d in (manager.devices.values() if manager is not None else []):
+        devices[d.hostname] = {
+            "ip": d.ip,
+            "busy": say_mod.busy_reason(d, bargein.for_device(d, config), queued),
+        }
+    # "agents" stays for callers written against grok-voice; no named agents here.
+    return {"devices": devices, "agents": {}}
+
+
+async def _read_http_request(reader: asyncio.StreamReader, max_body: int = 65536):
+    request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+    parts = request_line.decode("latin-1").strip().split()
+    if len(parts) < 2:
+        return None
+    headers = {}
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=5)
+        if line in (b"\r\n", b"\n", b""):
+            break
+        k, _, v = line.decode("latin-1").partition(":")
+        headers[k.strip().lower()] = v.strip()
+    try:
+        length = int(headers.get("content-length", 0) or 0)
+    except ValueError:
+        length = -1
+    if length < 0 or length > max_body:
+        raise say_mod.SayError(400 if length < 0 else 413, {"error": "bad body size"})
+    body = await asyncio.wait_for(reader.readexactly(length), timeout=10) if length else b""
+    return parts[0].upper(), parts[1], headers, body
+
+
+_HTTP_REASONS = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
+                 405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
+                 500: "Internal Server Error", 502: "Bad Gateway"}
+
+
+def _http_json(writer: asyncio.StreamWriter, status: int, obj) -> None:
+    body = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    writer.write(f"HTTP/1.1 {status} {_HTTP_REASONS.get(status, 'OK')}\r\n"
+                 f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                 f"Connection: close\r\n\r\n".encode() + body)
+
+
+async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | None,
+                     ready: asyncio.Event | None = None):
+    """POST /say and GET /say on say.host:say.port (only when say.enabled)."""
+    scfg = say_mod.SayConfig.from_config(config)
+    router = None   # named agents (pipeline/agents.py) exist only on grok-voice
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            try:
+                req = await _read_http_request(reader)
+                if req is None:
+                    return
+                method, path, headers, body = req
+                path = path.split("?", 1)[0].rstrip("/") or "/"
+                if path != "/say":
+                    status, resp = 404, {"error": "not found"}
+                elif method == "POST":
+                    status, resp = await say_request(config, scfg, router, manager,
+                                                     utterance_queue, headers, body)
+                elif method == "GET":
+                    say_mod.check_token(scfg, headers)
+                    status, resp = 200, say_status(config, manager, utterance_queue, router)
+                else:
+                    status, resp = 405, {"error": "use POST (or GET for status)"}
+            except say_mod.SayError as e:
+                status, resp = e.status, e.body
+            except Exception as e:
+                log.error(f"SAY   request failed: {e!r}")
+                status, resp = 500, {"error": str(e) or e.__class__.__name__}
+            _http_json(writer, status, resp)
+            await writer.drain()
+        except Exception as e:
+            log.debug(f"SAY   connection error: {e!r}")
+        finally:
+            writer.close()
+
+    try:
+        server = await asyncio.start_server(handle, scfg.host, scfg.port)
+    except OSError as e:
+        # e.g. the port is taken (another onju on this host): keep the voice
+        # pipeline running without the say endpoint rather than exit.
+        log.error(f"SAY   cannot listen on {scfg.host}:{scfg.port}: {e}; say endpoint off")
+        return
+    log.info(f"SAY   listening on {scfg.host}:{scfg.port} (POST /say)"
+             f"{' with token' if scfg.token else ''}")
+    if ready is not None:
+        ready.set()
+    async with server:
+        await server.serve_forever()
+
+
 def _log_startup_summary(config: dict) -> None:
     """Log the active endpoints and models so it's obvious at a glance how the
     pipeline is configured for this run."""
@@ -892,12 +1298,17 @@ async def main(config_path: str = None, do_warmup: bool = False, devices: list[s
     utterance_queue = asyncio.Queue()
 
     _log_startup_summary(config)
-    await asyncio.gather(
+    tasks = [
         udp_listener(config, manager, utterance_queue),
         multicast_listener(config, manager),
         process_utterances(config, manager, utterance_queue),
         control_server(config, manager),
-    )
+    ]
+    if say_mod.SayConfig.from_config(config).enabled:
+        tasks.append(say_server(config, manager, utterance_queue))
+    else:
+        log.info("SAY   disabled (say.enabled is not set)")
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

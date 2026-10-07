@@ -29,6 +29,8 @@ class Device:
         self.led_power = 0
         self.led_update_time = 0.0
         self.vad_writer: asyncio.StreamWriter | None = None  # persistent TCP for LED blinks
+        self.last_mic_at = 0.0      # time.time() of the last mic packet (say busy check)
+        self.say_active = False     # a POST /say is playing (pipeline/say.py)
 
         # PTT state
         self.ptt_buffer: list = []  # raw PCM frames during PTT

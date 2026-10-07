@@ -1,0 +1,639 @@
+"""
+Offline test for the "say" back door (POST /say, pipeline/say.py and
+main.py say_server / say_request / play_say):
+
+- off unless say.enabled: main() doesn't start the server at all (nothing
+  listens on the port); on, unknown paths give 404;
+- busy pod -> 409 with a JSON reason and nothing touched (no connection to
+  the pod, no state changed): voice turn in progress, turn queued, playing
+  (barge-in estimate), recording (VAD), listening (recent mic packets), a
+  say already running;
+- unknown pod / no pod -> 404; missing text, bad JSON -> 400;
+  wrong token -> 401;
+- happy path through a fake pod (a real TCP listener, real
+  pipeline/protocol.py): one audio connection per sentence with mic
+  timeout 0, Opus frames, then 0xDD 0 to close the mic; the requested
+  voice goes to the TTS as is (empty = TTS default); 200 with the
+  duration; one JSON line in the say log; listen=true keeps the mic open
+  (last header carries the default mic timeout, no 0xDD); wait=false
+  answers "queued" at once; an interrupt stops it (no 0xDD);
+- hermes-voice: no named agents and no tell_agent: a say is never passed
+  to the next voice turn (extra_context stays empty);
+- staged announce: optional filler + think_s + delay_s (THINKING held, mic
+  closed between parts, both lines in say.log; interrupt aborts the rest;
+  a second /say during the sequence gets 409).
+
+Reuses the stubs of tests/test_pause_flush.py. Run from the repo root:
+python3 tests/test_say.py
+"""
+import asyncio
+import glob
+import importlib.util
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+import types
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import test_pause_flush as pf  # noqa: E402  (installs the module stubs)
+
+m = pf.m
+say = m.say_mod
+TAG = pf.TAG
+MIC = pf.MIC
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The real wire protocol (test_pause_flush stubs pipeline.protocol).
+_spec = importlib.util.spec_from_file_location("real_protocol_under_test",
+                                               os.path.join(ROOT, "pipeline", "protocol.py"))
+proto = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(proto)
+
+
+
+def check(name, cond, detail=""):
+    pf.check(name, cond, detail)
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class FakePod:
+    """TCP listener speaking the pod side of the protocol: 0xAA header +
+    length-prefixed Opus frames until EOF, or a 6-byte command."""
+
+    def __init__(self):
+        self.conns = []        # dicts: kind, mic, frames
+        self.port = None
+
+    async def start(self):
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def _handle(self, reader, writer):
+        try:
+            header = await reader.readexactly(6)
+            if header[0] == 0xAA:
+                frames = 0
+                while True:
+                    try:
+                        n = int.from_bytes(await reader.readexactly(2), "big")
+                    except asyncio.IncompleteReadError:
+                        break
+                    if n == 0:
+                        break
+                    await reader.readexactly(n)
+                    frames += 1
+                self.conns.append({"kind": "audio", "mic": header[1] << 8 | header[2],
+                                   "frames": frames})
+            elif header[0] == 0xDD:
+                self.conns.append({"kind": "mic_cmd", "mic": header[1] << 8 | header[2]})
+            else:
+                self.conns.append({"kind": hex(header[0])})
+        finally:
+            writer.close()
+
+    def audio(self):
+        return [c for c in self.conns if c["kind"] == "audio"]
+
+    def mic_cmds(self):
+        return [c for c in self.conns if c["kind"] == "mic_cmd"]
+
+    async def stop(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+
+class FakeTTS:
+    def __init__(self, delay=0.02):
+        self.calls = []        # (sentence, voice_override)
+        self.delay = delay
+
+    async def synthesize_stream(self, sentence, voice, config, voice_override=None):
+        self.calls.append((sentence, voice_override))
+        await asyncio.sleep(self.delay)
+        yield b"\0\0" * 16000          # 1 s -> one batch -> encoder gives 1 frame
+
+
+def make_device(host="onju-test"):
+    return types.SimpleNamespace(
+        hostname=host, ip="127.0.0.1", ptt=False, voice="pepper",
+        processing=False, interrupted=asyncio.Event(), vad_writer=None,
+        vad=types.SimpleNamespace(recording=False), ptt_buffer=[],
+        last_mic_at=0.0, say_active=False,
+        conversation=None, last_user_text=None, last_response=None,
+    )
+
+
+class FakeManager:
+    def __init__(self, *devices):
+        self.devices = {d.hostname: d for d in devices}
+
+    def get_most_recent(self):
+        return next(reversed(self.devices.values())) if self.devices else None
+
+
+def make_config(pod_port, say_port, log_path, **say_extra):
+    cfg = pf.make_config()
+    cfg["network"]["tcp_port"] = pod_port
+    cfg["say"] = {"enabled": True, "host": "127.0.0.1", "port": say_port, "log": log_path,
+                  **say_extra}
+    return cfg
+
+
+async def http(port, method, path, obj=None, headers=None, raw=None):
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    body = raw if raw is not None else (json.dumps(obj).encode() if obj is not None else b"")
+    head = f"{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n"
+    for k, v in (headers or {}).items():
+        head += f"{k}: {v}\r\n"
+    writer.write(head.encode() + b"\r\n" + body)
+    await writer.drain()
+    data = await asyncio.wait_for(reader.read(), 20)
+    writer.close()
+    status_line, _, rest = data.partition(b"\r\n")
+    status = int(status_line.split()[1])
+    payload = rest.split(b"\r\n\r\n", 1)[1]
+    return status, json.loads(payload)
+
+
+class Env:
+    """Fake pod + say server + fakes installed in pipeline.main."""
+
+    def __init__(self, devices=None, queue=None, **say_extra):
+        self.devices = devices if devices is not None else [make_device()]
+        self.queue = queue if queue is not None else asyncio.Queue()
+        self.say_extra = say_extra
+
+    async def __aenter__(self):
+        m.bargein._by_host.clear()
+        self.pod = FakePod()
+        await self.pod.start()
+        self.tts = FakeTTS()
+        self.tmp = tempfile.mkdtemp(prefix="say-test-")
+        self.log_path = os.path.join(self.tmp, "say.log")
+        self.port = free_port()
+        self.config = make_config(self.pod.port, self.port, self.log_path, **self.say_extra)
+        m.tts.synthesize_stream = self.tts.synthesize_stream
+        m.open_audio_connection = proto.open_audio_connection
+        m.write_audio_frames = proto.write_audio_frames
+        m.close_audio_connection = proto.close_audio_connection
+        m.send_stop_listening = proto.send_stop_listening
+        m.OpusStreamEncoder = pf.FakeEncoder
+        self.manager = FakeManager(*self.devices)
+        ready = asyncio.Event()
+        self.server = asyncio.create_task(m.say_server(self.config, self.manager, self.queue, ready))
+        await asyncio.wait_for(ready.wait(), 5)
+        return self
+
+    async def __aexit__(self, *exc):
+        self.server.cancel()
+        try:
+            await self.server
+        except asyncio.CancelledError:
+            pass
+        await self.pod.stop()
+
+    def log_lines(self):
+        if not os.path.exists(self.log_path):
+            return []
+        with open(self.log_path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+
+async def test_disabled():
+    started = []
+
+    async def fake_say_server(*a, **k):
+        started.append(True)
+
+    async def noop(*a, **k):
+        return None
+
+    saved = {k: getattr(m, k) for k in ("load_config", "DeviceManager", "udp_listener",
+                                         "multicast_listener", "process_utterances",
+                                         "control_server", "say_server")}
+    try:
+        m.udp_listener = m.multicast_listener = m.process_utterances = m.control_server = noop
+        m.say_server = fake_say_server
+        m.DeviceManager = lambda config: FakeManager()
+        for name, say_cfg, enabled in (("absent", None, False),
+                                       ("empty", {}, False),
+                                       ("enabled: false", {"enabled": False, "port": 3104}, False),
+                                       ("enabled: true", {"enabled": True}, True)):
+            started.clear()
+            cfg = pf.make_config()
+            cfg["tts"] = {"backend": "local"}
+            cfg["logging"] = {"level": "WARNING"}
+            if say_cfg is not None:
+                cfg["say"] = say_cfg
+            m.load_config = lambda path=None, cfg=cfg: cfg
+            await m.main()
+            check(f"say {name}: server {'started' if enabled else 'not started'}",
+                  bool(started) == enabled)
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+    check("SayConfig: off by default, port 3104 (not onju-grok's 3103), 127.0.0.1",
+          not say.SayConfig({}).enabled and not say.SayConfig(None).enabled
+          and say.SayConfig({}).port == 3104
+          and say.SayConfig({}).host == "127.0.0.1"
+          and say.SayConfig({"port": 3111}).port == 3111)
+    check("hermes-voice: no tell_agent / agent memory in say.py",
+          not hasattr(say.SayConfig({}), "tell_agent") and not hasattr(say, "MEMORY"))
+
+
+async def test_refusals():
+    async with Env() as env:
+        dev = env.devices[0]
+        st, body = await http(env.port, "GET", "/nope")
+        check("unknown path -> 404", st == 404, f"{st} {body}")
+        st, body = await http(env.port, "POST", "/say", raw=b"not json")
+        check("bad JSON -> 400", st == 400, f"{st} {body}")
+        st, body = await http(env.port, "POST", "/say", {"voice": "tim-allen"})
+        check("missing text -> 400", st == 400 and "text" in body["error"], f"{st} {body}")
+        st, body = await http(env.port, "POST", "/say", {"text": "hi", "voice": 3})
+        check("voice not a string -> 400", st == 400 and "voice" in body["error"], f"{st} {body}")
+        st, body = await http(env.port, "POST", "/say", {"text": "hi", "device": "onju-other"})
+        check("unknown pod -> 404", st == 404 and body["error"] == "unknown pod", f"{st} {body}")
+
+        cases = [
+            ("voice turn in progress", lambda: setattr(dev, "processing", True), "voice turn"),
+            ("say already running", lambda: setattr(dev, "say_active", True), "say"),
+            ("recording", lambda: setattr(dev.vad, "recording", True), "recording"),
+            ("listening (mic packets)", lambda: setattr(dev, "last_mic_at", time.time()), "listening"),
+            ("playing (estimate)", lambda: m.bargein.for_device(dev, env.config).audio_sent(
+                time.monotonic(), 3.0), "playing"),
+            ("turn queued", lambda: env.queue.put_nowait(("x", "y")), "queued"),
+        ]
+        for name, make_busy, word in cases:
+            make_busy()
+            before = (dev.processing, dev.say_active, dev.interrupted.is_set())
+            st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} hello.", "voice": "tim-allen"})
+            check(f"busy ({name}) -> 409 with a reason",
+                  st == 409 and body.get("error") == "busy" and word in body.get("reason", ""),
+                  f"{st} {body}")
+            check(f"busy ({name}): nothing touched",
+                  not env.pod.conns and not env.tts.calls
+                  and (dev.processing, dev.say_active, dev.interrupted.is_set()) == before,
+                  f"{env.pod.conns} {env.tts.calls}")
+            # reset
+            dev.processing = dev.say_active = False
+            dev.vad.recording = False
+            dev.last_mic_at = 0.0
+            m.bargein._by_host.clear()
+            while not env.queue.empty():
+                env.queue.get_nowait()
+        check("refusals: nothing logged to say.log", env.log_lines() == [], f"{env.log_lines()}")
+
+    async with Env(devices=[]) as env:
+        st, body = await http(env.port, "POST", "/say", {"text": "hi"})
+        check("no pod known -> 404", st == 404 and "no pod" in body["error"], f"{st} {body}")
+
+    async with Env(token="s3cret") as env:
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} hi."})
+        check("token set, none given -> 401", st == 401 and not env.pod.conns, f"{st} {body}")
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} hi."},
+                              headers={"Authorization": "Bearer s3cret"})
+        check("token set, right token -> 200", st == 200, f"{st} {body}")
+
+
+async def test_happy():
+    async with Env() as env:
+        dev = env.devices[0]
+        text = f"{TAG} hello from the pod. {TAG} this is Robin."
+        st, body = await http(env.port, "POST", "/say", {"text": text, "voice": "tim-allen",
+                                                         "bot": "Robin"})
+        await asyncio.sleep(0.2)          # let the pod handler record the 0xDD
+        audio = env.pod.audio()
+        check("happy: 200 played, 2 sentences, duration from the frames",
+              st == 200 and body["status"] == "played" and body["sentences"] == 2
+              and body["played"] == 2 and abs(body["duration_s"] - 0.04) < 1e-6,
+              f"{st} {body}")
+        check("happy: voice to the TTS as is, bot only recorded",
+              [v for _, v in env.tts.calls] == ["tim-allen", "tim-allen"]
+              and body["bot"] == "robin" and body["voice"] == "tim-allen", f"{env.tts.calls} {body}")
+        check("happy: one audio connection per sentence, mic timeout 0, frames delivered",
+              len(audio) == 2 and all(c["mic"] == 0 and c["frames"] == 1 for c in audio),
+              f"{env.pod.conns}")
+        check("happy: mic closed at the end (0xDD 0, after the audio)",
+              env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}]
+              and env.pod.conns[-1]["kind"] == "mic_cmd", f"{env.pod.conns}")
+        check("happy: pod released (processing/say_active False)",
+              not dev.processing and not dev.say_active)
+        lines = env.log_lines()
+        check("happy: one JSON line in say.log with time, bot, text",
+              len(lines) == 1 and lines[0]["bot"] == "robin" and lines[0]["text"] == text
+              and lines[0]["status"] == "played" and lines[0].get("time"), f"{lines}")
+        st2, body2 = await http(env.port, "POST", "/say", {"text": f"{TAG} again."})
+        check("happy: a second say right after is refused while the pod plays (409)",
+              st2 == 409 and "playing" in body2["reason"], f"{st2} {body2}")
+
+        st, body = await http(env.port, "GET", "/say")
+        check("GET /say: pods with busy state, no agents",
+              st == 200 and dev.hostname in body["devices"]
+              and "playing" in (body["devices"][dev.hostname]["busy"] or "")
+              and body["agents"] == {}, f"{st} {body}")
+
+    # Empty voice: the TTS gets no override (configured default voice).
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} default voice."})
+        check("empty voice -> TTS default (no voice_override), bot none",
+              st == 200 and env.tts.calls == [(f"{TAG} default voice.", None)]
+              and body["voice"] is None and body["bot"] is None, f"{st} {body} {env.tts.calls}")
+
+    # raw_voice changes nothing without agents: the name goes to the TTS as is.
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say",
+                              {"text": f"{TAG} raw.", "voice": "data", "raw_voice": True})
+        check("raw_voice: voice passed as is",
+              st == 200 and [v for _, v in env.tts.calls] == ["data"], f"{st} {env.tts.calls}")
+
+    # listen=true: last header carries the default mic timeout, no 0xDD.
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say",
+                              {"text": f"{TAG} one. {TAG} two.", "voice": "pepper", "listen": True})
+        await asyncio.sleep(0.2)
+        check("listen: last sentence opens the mic, no 0xDD",
+              st == 200 and [c["mic"] for c in env.pod.audio()] == [0, MIC]
+              and not env.pod.mic_cmds(), f"{st} {env.pod.conns}")
+
+    # wait=false: answered at once, played in the background.
+    async with Env() as env:
+        env.tts.delay = 0.3
+        t0 = time.monotonic()
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} later.", "voice": "data"})
+        quick = time.monotonic() - t0
+        check("wait=true (default) answers after the audio was sent", quick >= 0.3, f"{quick:.2f}")
+        await asyncio.sleep(0.5)
+        env.pod.conns.clear()
+        m.bargein._by_host.clear()        # forget the first say's playback estimate
+        t0 = time.monotonic()
+        st, body = await http(env.port, "POST", "/say",
+                              {"text": f"{TAG} later.", "voice": "data", "wait": False})
+        quick = time.monotonic() - t0
+        check("wait=false: 200 queued at once", st == 200 and body["status"] == "queued"
+              and quick < 0.25, f"{st} {body} {quick:.2f}")
+        await asyncio.sleep(0.8)
+        check("wait=false: still played", len(env.pod.audio()) == 1, f"{env.pod.conns}")
+
+    # Interrupt (barge-in) after the first sentence: stops, no 0xDD, only
+    # the played sentence remembered.
+    async with Env() as env:
+        dev = env.devices[0]
+        orig = env.tts.synthesize_stream
+
+        async def ss(sentence, voice, config, voice_override=None):
+            if len(env.tts.calls) == 1:
+                dev.interrupted.set()
+            async for pcm in orig(sentence, voice, config, voice_override):
+                yield pcm
+        m.tts.synthesize_stream = ss
+        st, body = await http(env.port, "POST", "/say",
+                              {"text": f"{TAG} first. {TAG} second.", "voice": "pepper"})
+        await asyncio.sleep(0.2)
+        check("interrupt: status interrupted, 1 played, no 0xDD, pod released",
+              st == 200 and body["status"] == "interrupted" and body["played"] == 1
+              and not env.pod.mic_cmds() and not dev.processing and not dev.say_active,
+              f"{st} {body} {env.pod.conns}")
+        lines = env.log_lines()
+        check("interrupt: logged as interrupted",
+              len(lines) == 1 and lines[0]["status"] == "interrupted", f"{lines}")
+        check("no agents: voice passed to the TTS as is",
+              env.tts.calls and env.tts.calls[0][1] == "pepper", f"{env.tts.calls}")
+
+
+async def test_no_turn_note():
+    """hermes-voice: a say is never passed to the next voice turn (no
+    tell_agent; Hermes would take the note as the user's words)."""
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} said by the pod."})
+        check("no-note: say played first", st == 200 and body["status"] == "played", f"{st} {body}")
+    seen = []
+
+    class Conv(pf.FakeConversation):
+        async def stream(self, text, extra_context=None):
+            seen.append((text, extra_context))
+            async for d in super().stream(text, extra_context):
+                yield d
+
+    rec = pf.Recorder()
+    m.asr.transcribe = lambda *a, **k: pf._ret({"text": "hello", "no_speech_prob": 0.0})
+    m.stall_mod.decide_stall = lambda *a, **k: pf._ret(None)
+    m.tts.synthesize_stream = rec.synthesize_stream
+    m.open_audio_connection = rec.open_audio_connection
+    m.write_audio_frames = lambda w, f: True
+    m.close_audio_connection = pf._anoop
+    m.send_audio = rec.send_audio
+    m.send_state = pf._anoop
+    m.OpusStreamEncoder = pf.FakeEncoder
+    device = pf.make_device(Conv([f"{TAG} ok."]))
+    device.hostname = "onju-test"
+    q = asyncio.Queue()
+    await q.put((device, pf.FakeAudio()))
+    worker = asyncio.create_task(m.process_utterances(pf.make_config(), None, q))
+    deadline = time.monotonic() + 10
+    await asyncio.sleep(0)
+    while not q.empty() or device.processing or m._state_tasks:
+        if time.monotonic() > deadline:
+            break
+        await asyncio.sleep(0.01)
+    worker.cancel()
+    try:
+        await worker
+    except asyncio.CancelledError:
+        pass
+    check("no-note: next turn gets only the user's words, no extra_context",
+          seen == [("hello", None)], f"{seen}")
+
+
+def test_resolve():
+    cases = [
+        (("tim-allen", ""), ("tim-allen", None)),       # TTS voice as is
+        (("", ""), (None, None)),                       # TTS default voice
+        (("pepper", "Robin"), ("pepper", "robin")),     # bot only recorded
+        (("", "data"), (None, "data")),                 # bot does not pick a voice
+    ]
+    for (voice, bot), want in cases:
+        for raw in (False, True):
+            got = say.resolve_voice(None, voice, bot, raw=raw)
+            check(f"resolve voice={voice!r} bot={bot!r} raw={raw} -> {want}", got == want, f"{got}")
+    p = say.parse_request(say.SayConfig({"enabled": True}), b'{"text": "hi", "voice": "data", "raw_voice": true}')
+    check("parse: raw_voice kept", p["raw_voice"] is True, p)
+    p = say.parse_request(say.SayConfig({"enabled": True}), b'{"text": "hi"}')
+    check("parse: raw_voice defaults to false", p["raw_voice"] is False, p)
+
+
+def test_parse_staged():
+    scfg = say.SayConfig({"enabled": True})
+    r = say.parse_request(scfg, b'{"text": "answer.", "filler": "  Let me look.  ", "think_s": 3, "delay_s": 5}')
+    check("parse: filler cleaned, think_s/delay_s kept",
+          r["text"] == "answer." and r["filler"] == "Let me look."
+          and r["think_s"] == 3.0 and r["delay_s"] == 5.0, r)
+    r = say.parse_request(scfg, b'{"text": "hi."}')
+    check("parse: plain request has no filler and zero think/delay",
+          r["filler"] is None and r["think_s"] == 0.0 and r["delay_s"] == 0.0, r)
+    r = say.parse_request(scfg, b'{"text": "hi.", "think_s": 100, "delay_s": 999}')
+    check("parse: think_s capped at 30, delay_s at 120",
+          r["think_s"] == say.MAX_THINK_S and r["delay_s"] == say.MAX_DELAY_S, r)
+    for bad in (b'{"text": "hi.", "think_s": -1}',
+                b'{"text": "hi.", "think_s": "x"}',
+                b'{"text": "hi.", "filler": 1}'):
+        try:
+            say.parse_request(scfg, bad)
+            check(f"parse: bad {bad} raises", False)
+        except say.SayError as e:
+            check(f"parse: bad {bad} -> 400", e.status == 400, e.body)
+    r = say.parse_request(scfg, b'{"text": "hi.", "filler": "   "}')
+    check("parse: blank filler is None", r["filler"] is None, r)
+
+
+async def test_staged():
+    """filler -> wait for play -> THINKING -> answer; delay; interrupt; busy."""
+    states = []
+
+    async with Env() as env:
+        # Record fire_state (THINKING) without touching the real pod wire.
+        real_fire = m.fire_state
+
+        def record_fire(ip, port, state):
+            states.append(state)
+            return real_fire(ip, port, state)
+
+        m.fire_state = record_fire
+        try:
+            text = f"{TAG} I do not know."
+            filler = f"{TAG} Let me look that up."
+            t0 = time.monotonic()
+            st, body = await http(env.port, "POST", "/say", {
+                "text": text, "voice": "pepper", "filler": filler, "think_s": 0.35,
+            })
+            elapsed = time.monotonic() - t0
+            await asyncio.sleep(0.2)
+            audio = env.pod.audio()
+            check("staged: 200 played, filler+answer both played",
+                  st == 200 and body["status"] == "played"
+                  and body["played"] == 1 and body["filler_played"] == 1
+                  and body.get("filler") == filler and body.get("think_s") == 0.35,
+                  f"{st} {body}")
+            check("staged: two audio connections (filler then answer), mic 0 on both",
+                  len(audio) == 2 and all(c["mic"] == 0 for c in audio), f"{env.pod.conns}")
+            check("staged: mic closed only after the answer (one 0xDD)",
+                  env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}], f"{env.pod.conns}")
+            check("staged: TTS got filler then answer in pepper's voice",
+                  [s for s, _ in env.tts.calls] == [filler, text]
+                  and all(v == "pepper" for _, v in env.tts.calls), f"{env.tts.calls}")
+            check("staged: THINKING fired at least once during the hold",
+                  states.count(2) >= 1, f"states={states}")
+            # Filler play wait uses bargein margin (~0.5s) + think_s.
+            check("staged: elapsed covers filler-play wait + think_s",
+                  elapsed >= 0.35, f"{elapsed:.2f}")
+            lines = env.log_lines()
+            check("staged: say.log has filler line then answer line",
+                  len(lines) == 2 and lines[0].get("filler") is True
+                  and lines[0]["text"] == filler and lines[0]["status"] == "played"
+                  and lines[1].get("filler") is None and lines[1]["text"] == text
+                  and lines[1]["status"] == "played", f"{lines}")
+        finally:
+            m.fire_state = real_fire
+
+    # delay_s: claims immediately (second /say -> 409), then speaks.
+    async with Env() as env:
+        env.tts.delay = 0.05
+        started = asyncio.Event()
+        done = asyncio.Event()
+
+        async def delayed():
+            started.set()
+            return await http(env.port, "POST", "/say", {
+                "text": f"{TAG} after delay.", "voice": "data", "delay_s": 0.4,
+            })
+
+        task = asyncio.create_task(delayed())
+        await started.wait()
+        await asyncio.sleep(0.05)
+        st2, body2 = await http(env.port, "POST", "/say", {"text": f"{TAG} no."})
+        check("delay: second /say during delay is 409 busy",
+              st2 == 409 and "say" in body2["reason"], f"{st2} {body2}")
+        st, body = await task
+        check("delay: first say plays after delay_s",
+              st == 200 and body["status"] == "played" and body.get("delay_s") == 0.4
+              and body.get("delayed") is True, f"{st} {body}")
+
+    # Interrupt during THINKING: filler was played, answer never starts.
+    async with Env() as env:
+        states.clear()
+        real_fire = m.fire_state
+
+        def record_fire(ip, port, state):
+            states.append(state)
+            # Trip the interrupt the first time THINKING is requested.
+            if state == 2:
+                env.devices[0].interrupted.set()
+            return real_fire(ip, port, state)
+
+        m.fire_state = record_fire
+        try:
+            st, body = await http(env.port, "POST", "/say", {
+                "text": f"{TAG} answer never.", "voice": "tim-allen",
+                "filler": f"{TAG} looking.", "think_s": 2.0,
+            })
+            await asyncio.sleep(0.2)
+            check("interrupt-in-think: status interrupted, answer not played",
+                  st == 200 and body["status"] == "interrupted"
+                  and body["played"] == 0 and body["filler_played"] == 1,
+                  f"{st} {body}")
+            check("interrupt-in-think: only filler audio, no 0xDD (aborted)",
+                  len(env.pod.audio()) == 1 and not env.pod.mic_cmds(),
+                  f"{env.pod.conns}")
+            check("interrupt-in-think: pod released",
+                  not env.devices[0].processing and not env.devices[0].say_active)
+            lines = env.log_lines()
+            check("interrupt-in-think: filler logged played, answer interrupted",
+                  len(lines) == 2 and lines[0].get("filler") and lines[0]["status"] == "played"
+                  and lines[1]["status"] == "interrupted" and not lines[1].get("filler"),
+                  f"{lines}")
+        finally:
+            m.fire_state = real_fire
+
+    # listen=true on a staged say: only the answer opens the mic.
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say", {
+            "text": f"{TAG} final.", "voice": "pepper",
+            "filler": f"{TAG} hold on.", "think_s": 0.2, "listen": True,
+        })
+        await asyncio.sleep(0.2)
+        mics = [c["mic"] for c in env.pod.audio()]
+        check("staged+listen: filler mic 0, answer opens mic, no 0xDD",
+              st == 200 and mics == [0, MIC] and not env.pod.mic_cmds(),
+              f"{st} {mics} {env.pod.conns}")
+
+
+
+async def main():
+    await test_disabled()
+    await test_refusals()
+    await test_happy()
+    await test_staged()
+    await test_no_turn_note()
+    test_resolve()
+    test_parse_staged()
+    for f in glob.glob(f"/tmp/tts-debug/*_{TAG}*.wav"):
+        os.remove(f)
+    total = len(pf.CHECKS)
+    print(f"{total - len(pf.FAILS)}/{total} passed")
+    return 1 if pf.FAILS else 0
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.WARNING)
+    sys.exit(asyncio.run(main()))
