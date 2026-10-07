@@ -225,6 +225,7 @@ See [`pipeline/config.yaml.example`](pipeline/config.yaml.example) for all optio
 | `vad` | Voice activity detection thresholds and timing; when speech may interrupt a reply on VOX pods (`interrupt_min_ms`, `interrupt_only_while_playing`) |
 | `network` | UDP/TCP/multicast ports |
 | `device` | Volume, mic timeout, LED settings, greeting audio |
+| `say` | Optional `POST /say` endpoint: make the pod speak a text in a TTS voice without a voice turn (off by default; see `pipeline/say.py`) |
 
 ### Environment variables
 
@@ -261,6 +262,7 @@ python tests/test_stream.py "your prompt here"
 python tests/test_pause_flush.py
 python tests/test_tts_payload.py   # TTS request payloads (offline)
 python tests/test_pod_connection.py  # when the pod audio connection opens (offline)
+python tests/test_say.py           # POST /say endpoint, fake pod (offline)
 python tests/test_led_state.py
 python tests/test_vox_interrupt.py
 python tests/test_agents.py

@@ -27,7 +27,8 @@ async def synthesize(text: str, voice: str, config: dict,
 
     voice_override (optional, per call): use this voice instead of the
     configured one, e.g. the voice of the agent a turn was routed to
-    (pipeline/agents.py). None = unchanged behaviour."""
+    (pipeline/agents.py) or the voice a POST /say asks for (pipeline/say.py).
+    None = unchanged behaviour."""
     backend = config["tts"]["backend"]
     if backend == "elevenlabs":
         return await _elevenlabs(text, voice_override or voice, config)

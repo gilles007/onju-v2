@@ -168,6 +168,23 @@ network:
   multicast_port: 12345
   control_port: 3002
 
+# Say endpoint (optional, off by default): POST /say makes the pod speak a
+# given text in a TTS voice or a named agent's voice, without a voice turn
+# (announcements, filming), on its own small HTTP server. Without this
+# section, or with enabled: false, nothing listens and turns work exactly
+# as before. The pod is refused (HTTP 409) while it is in a turn, playing,
+# recording or listening. Every say is logged to `log` (one JSON line
+# each). See pipeline/say.py for the request fields, e.g.:
+#   curl -X POST http://127.0.0.1:3103/say -H 'Content-Type: application/json' \
+#     -d '{"voice": "pepper", "text": "Dinner is ready."}'
+# say:
+#   enabled: true
+#   host: "127.0.0.1"                        # 0.0.0.0 = reachable from the LAN (then set a token)
+#   port: 3103                               # default 3103 here (hermes-voice defaults to 3104)
+#   token: ""                                # optional: then send "Authorization: Bearer <token>"
+#   log: "/tmp/tts-debug/say.log"            # JSON lines: time, device, bot, voice, status, text
+#   tell_agent: true                         # the agent's next turn on that pod is told what it "said"
+
 audio:
   sample_rate: 16000
   chunk_size: 512                            # 32ms at 16kHz (matches ESP32 SAMPLE_CHUNK_SIZE)

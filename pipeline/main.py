@@ -1226,7 +1226,13 @@ async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | Non
         finally:
             writer.close()
 
-    server = await asyncio.start_server(handle, scfg.host, scfg.port)
+    try:
+        server = await asyncio.start_server(handle, scfg.host, scfg.port)
+    except OSError as e:
+        # e.g. the port is taken (another onju on this host): keep the voice
+        # pipeline running without the say endpoint rather than exit.
+        log.error(f"SAY   cannot listen on {scfg.host}:{scfg.port}: {e}; say endpoint off")
+        return
     log.info(f"SAY   listening on {scfg.host}:{scfg.port} (POST /say)"
              f"{' with token' if scfg.token else ''}")
     if ready is not None:
