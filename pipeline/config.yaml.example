@@ -176,3 +176,10 @@ device:
 
 logging:
   level: "INFO"
+
+# Debug WAVs: every spoken sentence is also saved to /tmp/tts-debug as
+# YYYYMMDD-HHMMSS_<first 20 characters>.wav, with "__" before the text for
+# a stall or filler line (same second: -2, -3 ... added). The time is local:
+# the TZ env var's zone if set, else debug.tz, else America/Los_Angeles.
+# debug:
+#   tz: "America/Los_Angeles"
