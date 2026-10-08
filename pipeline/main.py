@@ -13,6 +13,7 @@ import numpy as np
 import yaml
 
 from pipeline import agents, bargein
+from pipeline import debug_wav
 from pipeline import say as say_mod
 from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, OpusStreamEncoder
 from pipeline.conversation import create_backend, sentence_chunks
@@ -244,7 +245,8 @@ async def multicast_listener(config: dict, manager: DeviceManager):
 
 async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool,
                           turn_t0: float, tts_kwargs: dict | None = None,
-                          mic_timeout: int | None = None) -> tuple[bool, int]:
+                          mic_timeout: int | None = None,
+                          stall: bool = False) -> tuple[bool, int]:
     """Synthesize, encode, and stream one sentence over a single
     TCP connection. Opus frames are written as the TTS produces
     audio; closing the connection signals end-of-segment to the pod.
@@ -253,7 +255,8 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
     (interrupt, TTS error, pod connection failed): the caller stops there.
     Used by a voice turn (process_utterances, through its send_sentence)
     and by the say endpoint (say_server). mic_timeout: the header's mic
-    timeout; None = default_mic_timeout for a final sentence, else 0."""
+    timeout; None = default_mic_timeout for a final sentence, else 0.
+    stall: a stall or filler line; only changes its debug WAV name."""
     tcp_port = config["network"]["tcp_port"]
     dev_cfg = config["device"]
     sample_rate = config["audio"]["sample_rate"]
@@ -393,7 +396,8 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
     import pathlib, wave as _wave
     _dbg_dir = pathlib.Path("/tmp/tts-debug")
     _dbg_dir.mkdir(exist_ok=True)
-    _dbg_path = _dbg_dir / f"{int(time.time())}_{sentence[:20].replace(' ','_')}.wav"
+    _dbg_path = debug_wav.unique_path(
+        _dbg_dir, debug_wav.wav_name(sentence, debug_wav.local_now(config), stall=stall))
     with _wave.open(str(_dbg_path), "wb") as _w:
         _w.setnchannels(1); _w.setsampwidth(2)
         _w.setframerate(config["audio"]["sample_rate"])
@@ -508,11 +512,12 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
 
 
-            async def send_sentence(sentence: str, is_final: bool) -> bool:
+            async def send_sentence(sentence: str, is_final: bool, stall: bool = False) -> bool:
                 """One sentence of this turn (see stream_sentence)."""
                 nonlocal sent_partial
                 ok, _ = await stream_sentence(config, device, sentence, is_final=is_final,
-                                              turn_t0=turn_t0, tts_kwargs=tts_kwargs)
+                                              turn_t0=turn_t0, tts_kwargs=tts_kwargs,
+                                              stall=stall)
                 if ok and not is_final:
                     sent_partial = True
                 return ok
@@ -553,7 +558,8 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             stall_task: asyncio.Task | None = None
             extra_context: str | None = None
             if stall_text:
-                stall_task = asyncio.create_task(send_sentence(stall_text, is_final=False))
+                stall_task = asyncio.create_task(send_sentence(stall_text, is_final=False,
+                                                               stall=True))
 
                 # The pod drops to IDLE when the stall line finishes playing.
                 # If the answer hasn't started yet, ask for THINKING again; it
@@ -910,9 +916,10 @@ async def _say_hold_thinking(config: dict, device, think_s: float) -> bool:
 
 
 async def _say_stream_part(config: dict, device, sentences: list[str], *,
-                           t0: float, tts_kwargs: dict, listen: bool) -> tuple[bool, int, int]:
+                           t0: float, tts_kwargs: dict, listen: bool,
+                           stall: bool = False) -> tuple[bool, int, int]:
     """Stream sentences; listen only on the last if listen. Returns
-    (ok, frames, played_count)."""
+    (ok, frames, played_count). stall: filler lines (debug WAV name only)."""
     frames = 0
     played = 0
     ok = True
@@ -920,7 +927,8 @@ async def _say_stream_part(config: dict, device, sentences: list[str], *,
         last = i == len(sentences) - 1
         mic = config["device"]["default_mic_timeout"] if (last and listen) else 0
         ok, n = await stream_sentence(config, device, sentence, is_final=last,
-                                      turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic)
+                                      turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic,
+                                      stall=stall)
         frames += n
         if not ok:
             break
@@ -981,7 +989,8 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
         if ok and filler_sentences:
             stage = "filler"
             ok, n, filler_played = await _say_stream_part(
-                config, device, filler_sentences, t0=t0, tts_kwargs=tts_kwargs, listen=False)
+                config, device, filler_sentences, t0=t0, tts_kwargs=tts_kwargs, listen=False,
+                stall=True)
             filler_frames = n
             frames += n
             if ok and not await _say_wait_playback(device, barge):
