@@ -63,7 +63,7 @@ DEFAULT_ONLY_WHILE_PLAYING = True
 class BargeIn:
     def __init__(self, hostname: str, vad_cfg: dict):
         self.hostname = hostname
-        # Same default as config.yaml.example; the VAD itself requires the key.
+        # Same default as config-example.yaml; the VAD itself requires the key.
         self.threshold = vad_cfg.get("threshold", 0.5)
         self.min_s = float(vad_cfg.get("interrupt_min_ms", DEFAULT_MIN_MS)) / 1000
         self.only_while_playing = bool(vad_cfg.get("interrupt_only_while_playing",

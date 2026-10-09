@@ -132,7 +132,7 @@ uv pip install -e .
 brew install opus portaudio
 
 # Configure
-cp pipeline/config.yaml.example pipeline/config.yaml
+cp pipeline/config-example.yaml pipeline/config.yaml
 # Edit config.yaml with your API keys and preferences
 ```
 
@@ -205,7 +205,7 @@ If you don't have a custom PCB, you can use the [M5Stack ATOM Echo](https://shop
 
 ## Configuration reference
 
-See [`pipeline/config.yaml.example`](pipeline/config.yaml.example) for all options. Key sections:
+See [`pipeline/config-example.yaml`](pipeline/config-example.yaml) for all options. Key sections:
 
 | Section | What it controls |
 |---|---|
