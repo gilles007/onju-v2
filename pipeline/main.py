@@ -396,8 +396,9 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
     import pathlib, wave as _wave
     _dbg_dir = pathlib.Path("/tmp/tts-debug")
     _dbg_dir.mkdir(exist_ok=True)
-    _dbg_path = debug_wav.unique_path(
-        _dbg_dir, debug_wav.wav_name(sentence, debug_wav.local_now(config), stall=stall))
+    _dbg_voice = debug_wav.tts_voice(config, device.voice, tts_kwargs.get("voice_override"))
+    _dbg_path = debug_wav.unique_path(_dbg_dir, debug_wav.wav_name(
+        sentence, debug_wav.local_now(config), voice=_dbg_voice, stall=stall))
     with _wave.open(str(_dbg_path), "wb") as _w:
         _w.setnchannels(1); _w.setsampwidth(2)
         _w.setframerate(config["audio"]["sample_rate"])

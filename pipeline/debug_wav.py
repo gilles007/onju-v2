@@ -1,8 +1,11 @@
 """Names for the debug WAVs stream_sentence() writes to /tmp/tts-debug.
 
-    20261008-140912_You_are_most_welcome.wav    a sentence
-    20261008-140912__Let_me_check.wav           a stall line (two underscores)
-    20261008-140912_You_are_most_welcome-2.wav  same name in the same second
+    20261008-140912_pepper_You_are_most_welcome.wav    a sentence
+    20261008-140912_pepper__Let_me_check.wav           a stall line (two
+                                                       underscores after the voice)
+    20261008-140912_pepper_You_are_most_welcome-2.wav  same name in the same second
+
+The voice is the TTS voice asked for that sentence (see tts_voice()).
 
 The time is local: the TZ environment variable when it is set, else
 `debug.tz` from the config, else America/Los_Angeles (the container clock
@@ -17,7 +20,7 @@ import re
 log = logging.getLogger(__name__)
 
 DEFAULT_TZ = "America/Los_Angeles"
-PREVIEW_CHARS = 20
+PREVIEW_CHARS = 30
 _warned = False
 
 
@@ -38,16 +41,39 @@ def local_now(config: dict) -> datetime.datetime:
         return datetime.datetime.now(datetime.timezone.utc)
 
 
-def wav_name(sentence: str, when: datetime.datetime, *, stall: bool = False) -> str:
-    """YYYYMMDD-HHMMSS_<preview>.wav, or YYYYMMDD-HHMMSS__<preview>.wav for a
-    stall line. The preview is the first 20 characters without quotes,
-    spaces as underscores, and only letters, digits and . , - kept (none
-    at either end)."""
-    text = re.sub(r"[\"'\u2018\u2019\u201c\u201d`]", "", sentence).strip()
-    preview = re.sub(r"\s+", "_", text[:PREVIEW_CHARS])
-    preview = re.sub(r"[^\w.,-]", "", preview)
-    preview = re.sub(r"_+", "_", preview).strip("_.,-") or "empty"
-    return f"{when:%Y%m%d-%H%M%S}{'__' if stall else '_'}{preview}.wav"
+def tts_voice(config: dict, voice: str | None = None,
+              voice_override: str | None = None) -> str:
+    """The voice name pipeline/services/tts.py sends for a sentence: the
+    per-call voice_override, else the configured voice of the TTS backend
+    (voice = the device's voice, used by elevenlabs and local_stream)."""
+    tcfg = config.get("tts") or {}
+    backend = tcfg.get("backend", "local")
+    if voice_override:
+        return voice_override
+    if backend == "elevenlabs":
+        return voice or ""
+    if backend == "local_stream":
+        return (tcfg.get("local_stream") or {}).get("voice") or voice or ""
+    return (tcfg.get(backend) or tcfg.get("local") or {}).get("voice", "af_heart")
+
+
+def _clean(text: str, chars: int) -> str:
+    """First chars characters without quotes, spaces as underscores, only
+    letters, digits and . , - kept (none at either end)."""
+    text = re.sub(r"[\"'\u2018\u2019\u201c\u201d`]", "", text or "").strip()
+    out = re.sub(r"\s+", "_", text[:chars])
+    out = re.sub(r"[^\w.,-]", "", out)
+    return re.sub(r"_+", "_", out).strip("_.,-")
+
+
+def wav_name(sentence: str, when: datetime.datetime, *, voice: str = "",
+             stall: bool = False) -> str:
+    """YYYYMMDD-HHMMSS_<voice>_<preview>.wav, or ..._<voice>__<preview>.wav
+    for a stall line. The preview is the first 30 characters of the
+    sentence; voice and preview are cleaned by _clean()."""
+    voice = _clean(voice, 40) or "default"
+    preview = _clean(sentence, PREVIEW_CHARS) or "empty"
+    return f"{when:%Y%m%d-%H%M%S}_{voice}{'__' if stall else '_'}{preview}.wav"
 
 
 def unique_path(directory: pathlib.Path, name: str) -> pathlib.Path:
