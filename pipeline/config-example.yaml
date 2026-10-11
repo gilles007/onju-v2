@@ -176,16 +176,29 @@ device:
   led_update_period: 0.25
   greeting: false
   greeting_wav: "data/hello_imhere.wav"
-  # Post-playback mic holdoff (VOX pods), in ms: after the pod finishes
-  # speaking it discards mic audio for this long, so the tail of its own
-  # playback (128 ms stale mic buffer + speaker/room ring-down) is not heard
-  # as "Thank you." / "Bye.". A tap skips it; PTT never uses it. Sent to the
-  # pod (0xEF command) each time it announces itself. Unset = nothing sent,
-  # the pod keeps its firmware default of 256 ms. Range 0..2000.
-  # 64 / 128: too short to clear the 128 ms stale buffer, not recommended.
-  # 256: normal use.  512: conservative, for filming.
-  # Firmware older than 20261011 does not know 0xEF: it flashes red once and
-  # drops that one connection (harmless), so leave this unset until reflashed.
+  # mic_holdoff_ms: how long the pod stays deaf right after it stops talking.
+  #
+  # Why it exists (found 2026-10-11): the pod can't listen while it speaks,
+  # and its mic buffer isn't read during playback. The moment playback ends,
+  # the first ~128 ms it sends are therefore the end of its OWN voice, plus a
+  # bit of speaker/room ring-down. In VOX mode the server took that as speech:
+  # ASR heard "Thank you." (dropped as no speech, which then reopened the mic
+  # for default_mic_timeout = a 60 s 'busy' pod) or "Bye." (a real turn to
+  # the default agent). With the holdoff, the pod reads and throws away mic
+  # audio for this many ms after playback, so it never hears itself.
+  #
+  # Trade-off: anything said in that window after the pod stops is lost.
+  # A tap skips the holdoff (mic opens at once); PTT pods never use it.
+  #
+  # How it gets to the pod: the server sends it as the 0xEF settings command
+  # (setting id 1) each time a pod announces itself. Unset = nothing is sent
+  # and the pod keeps its firmware default of 256 ms. Range 0..2000 ms.
+  #   64 / 128  too short to clear the 128 ms stale buffer; not recommended
+  #   256       normal use (firmware default)
+  #   512       extra safe, e.g. while filming
+  # Needs firmware from 2026-10-11 or later. Older firmware doesn't know 0xEF:
+  # it flashes red once and drops that one connection (harmless), so leave
+  # this unset until the pods are reflashed.
   # mic_holdoff_ms: 256
 
 logging:
