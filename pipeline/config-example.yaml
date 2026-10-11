@@ -159,6 +159,9 @@ network:
 #   port: 3104                               # default 3104 (onju-grok uses 3103 on the same host)
 #   token: ""                                # optional: then send "Authorization: Bearer <token>"
 #   log: "/tmp/tts-debug/say.log"            # JSON lines: time, device, voice, status, text
+#   render: sentence                         # sentence (default): render+play one sentence at a time;
+#                                            # whole: render all sentences, then play them back to back
+#                                            # (no gaps); only with tts.backend local, ignored otherwise
 
 audio:
   sample_rate: 16000

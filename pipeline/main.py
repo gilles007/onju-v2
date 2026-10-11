@@ -243,10 +243,16 @@ async def multicast_listener(config: dict, manager: DeviceManager):
         await greet_device(device, config)
 
 
+async def _pcm_chunks(chunks: list[bytes]):
+    for c in chunks:
+        yield c
+
+
 async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool,
                           turn_t0: float, tts_kwargs: dict | None = None,
                           mic_timeout: int | None = None,
-                          stall: bool = False) -> tuple[bool, int]:
+                          stall: bool = False,
+                          pcm: list[bytes] | None = None) -> tuple[bool, int]:
     """Synthesize, encode, and stream one sentence over a single
     TCP connection. Opus frames are written as the TTS produces
     audio; closing the connection signals end-of-segment to the pod.
@@ -256,7 +262,9 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
     Used by a voice turn (process_utterances, through its send_sentence)
     and by the say endpoint (say_server). mic_timeout: the header's mic
     timeout; None = default_mic_timeout for a final sentence, else 0.
-    stall: a stall or filler line; only changes its debug WAV name."""
+    stall: a stall or filler line; only changes its debug WAV name.
+    pcm: audio already rendered for this sentence (say render: whole, see
+    _say_render), sent instead of calling the TTS. None = call the TTS."""
     tcp_port = config["network"]["tcp_port"]
     dev_cfg = config["device"]
     sample_rate = config["audio"]["sample_rate"]
@@ -326,9 +334,10 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
                     f"(pod waits at most 2 s for each frame)")
         return True
 
+    audio = (_pcm_chunks(pcm) if pcm is not None else
+             tts.synthesize_stream(sentence, device.voice, config, **tts_kwargs))
     try:
-        async for pcm in tts.synthesize_stream(
-                sentence, device.voice, config, **tts_kwargs):
+        async for pcm in audio:
             if device.interrupted.is_set():
                 log.info(f"Interrupted mid-stream "
                          f"({n_frames} frames sent)")
@@ -849,33 +858,67 @@ async def _say_wait_playback(device, barge) -> bool:
     return not device.interrupted.is_set()
 
 
-async def _say_hold_thinking(config: dict, device, think_s: float) -> bool:
+async def _say_hold_thinking(config: dict, device, think_s: float,
+                             render: asyncio.Task | None = None) -> bool:
     """Hold STATE_THINKING for think_s (re-send every THINK_REFRESH_S).
+    render (say render: whole): also wait until that render task is done,
+    with THINKING still on if think_s > 0 (no LEDs if think_s is 0).
     Returns False if interrupted. Speaking LEDs take over when the answer
     audio connection opens (firmware sets VS_SPEAKING on 0xAA)."""
-    if think_s <= 0:
+    if think_s <= 0 and render is None:
         return not device.interrupted.is_set()
     tcp_port = config["network"]["tcp_port"]
-    fire_state(device.ip, tcp_port, STATE_THINKING)
+    if think_s > 0:
+        fire_state(device.ip, tcp_port, STATE_THINKING)
     end = time.monotonic() + think_s
     next_refresh = time.monotonic() + THINK_REFRESH_S
     while True:
         if device.interrupted.is_set():
             return False
         now = time.monotonic()
-        if now >= end:
+        if now >= end and (render is None or render.done()):
             return True
-        if now >= next_refresh:
+        if think_s > 0 and now >= next_refresh:
             fire_state(device.ip, tcp_port, STATE_THINKING)
             next_refresh = now + THINK_REFRESH_S
-        await asyncio.sleep(min(0.05, end - now, max(0.0, next_refresh - now)))
+        await asyncio.sleep(max(0.0, min(0.05, end - now, next_refresh - now)) if now < end else 0.05)
+
+
+async def _say_render(config: dict, device, sentences: list[str], tts_kwargs: dict,
+                      after: asyncio.Task | None = None) -> list[list[bytes]]:
+    """say render: whole. Render every sentence's audio before any of it is
+    sent (same TTS call as stream_sentence), so they play back to back.
+    after: a render to finish first (the filler, before the answer).
+    Stops early on interrupt or a TTS error: sentences it didn't render are
+    synthesized by stream_sentence as usual (which then logs the error)."""
+    if after is not None:
+        await after
+    t = time.monotonic()
+    out = []
+    for sentence in sentences:
+        chunks = []
+        try:
+            async for pcm in tts.synthesize_stream(sentence, device.voice, config, **tts_kwargs):
+                if device.interrupted.is_set():
+                    return out
+                chunks.append(pcm)
+        except Exception as e:
+            log.warning(f"SAY   render failed for {sentence!r}: {e}")
+            return out
+        out.append(chunks)
+    log.info(f"SAY   rendered {len(out)} sentence(s) in {time.monotonic() - t:.2f}s")
+    return out
 
 
 async def _say_stream_part(config: dict, device, sentences: list[str], *,
                            t0: float, tts_kwargs: dict, listen: bool,
-                           stall: bool = False) -> tuple[bool, int, int]:
+                           stall: bool = False,
+                           rendered: list[list[bytes]] | None = None) -> tuple[bool, int, int]:
     """Stream sentences; listen only on the last if listen. Returns
-    (ok, frames, played_count). stall: filler lines (debug WAV name only)."""
+    (ok, frames, played_count). stall: filler lines (debug WAV name only).
+    rendered: audio from _say_render (say render: whole), one entry per
+    sentence from the first; sentences without one call the TTS."""
+    rendered = rendered or []
     frames = 0
     played = 0
     ok = True
@@ -884,7 +927,8 @@ async def _say_stream_part(config: dict, device, sentences: list[str], *,
         mic = config["device"]["default_mic_timeout"] if (last and listen) else 0
         ok, n = await stream_sentence(config, device, sentence, is_final=last,
                                       turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic,
-                                      stall=stall)
+                                      stall=stall,
+                                      pcm=rendered[i] if i < len(rendered) else None)
         frames += n
         if not ok:
             break
@@ -908,7 +952,13 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
     unchanged): delay_s → filler (mic closed) → wait for filler playback →
     STATE_THINKING for think_s → answer. listen applies only to the final
     answer sentence; between parts the mic stays closed (mic_timeout 0,
-    and 0xDD only after the answer when listen is false)."""
+    and 0xDD only after the answer when listen is false).
+
+    say render: whole (tts.backend local only, say.render_whole): each part
+    is rendered in full before it plays, so its sentences play back to back.
+    The renders start right away (filler first, then the answer), so delay_s,
+    the filler playback and think_s hide the answer's TTS time; if it isn't
+    ready when think_s ends, THINKING stays on until it is."""
     tcp_port = config["network"]["tcp_port"]
     frame_s = config["audio"]["opus_frame_size"] / config["audio"]["sample_rate"]
     t0 = time.monotonic()
@@ -923,6 +973,13 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
     ok = True
     stage = "start"
     delayed = False
+    filler_render = answer_render = None
+    if say_mod.render_whole(scfg, config):
+        if filler_sentences:
+            filler_render = asyncio.create_task(
+                _say_render(config, device, filler_sentences, tts_kwargs))
+        answer_render = asyncio.create_task(
+            _say_render(config, device, sentences, tts_kwargs, after=filler_render))
     log.info(f"SAY   {device.hostname} voice={tts_voice or 'tts default'} bot={bot or '-'} "
              f"{len(sentences)} sentence(s)"
              f"{f', filler={filler_text!r}' if filler_text else ''}"
@@ -944,22 +1001,28 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
                     stage = "delay_busy"
         if ok and filler_sentences:
             stage = "filler"
-            ok, n, filler_played = await _say_stream_part(
-                config, device, filler_sentences, t0=t0, tts_kwargs=tts_kwargs, listen=False,
-                stall=True)
+            ok = await _say_hold_thinking(config, device, 0, render=filler_render)
+            if ok:
+                ok, n, filler_played = await _say_stream_part(
+                    config, device, filler_sentences, t0=t0, tts_kwargs=tts_kwargs,
+                    listen=False, stall=True,
+                    rendered=filler_render.result() if filler_render else None)
+            else:
+                n = 0
             filler_frames = n
             frames += n
             if ok and not await _say_wait_playback(device, barge):
                 ok = False
-        if ok and think_s > 0:
+        if ok and (think_s > 0 or answer_render is not None):
             stage = "think"
-            if not await _say_hold_thinking(config, device, think_s):
+            if not await _say_hold_thinking(config, device, think_s, render=answer_render):
                 ok = False
         if ok and sentences:
             stage = "answer"
             # Final part of a multi-stage say, or the only part of a plain one.
             ok, n, played = await _say_stream_part(
-                config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen)
+                config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen,
+                rendered=answer_render.result() if answer_render else None)
             frames += n
         if ok and not listen and not device.ptt and (played or filler_played):
             # The pod opens its mic for at least 20 s after every playback
@@ -968,6 +1031,9 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
             # waits in its TCP backlog and applies right after playback.
             await send_stop_listening(device.ip, tcp_port, 0)
     finally:
+        for task in (filler_render, answer_render):
+            if task is not None and not task.done():
+                task.cancel()
         device.processing = False
         device.say_active = False
     if ok:
@@ -1190,7 +1256,11 @@ async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | Non
         log.error(f"SAY   cannot listen on {scfg.host}:{scfg.port}: {e}; say endpoint off")
         return
     log.info(f"SAY   listening on {scfg.host}:{scfg.port} (POST /say)"
-             f"{' with token' if scfg.token else ''}")
+             f"{' with token' if scfg.token else ''}"
+             f"{', render=whole' if say_mod.render_whole(scfg, config) else ''}")
+    if scfg.render == "whole" and not say_mod.render_whole(scfg, config):
+        log.warning(f"SAY   render: whole has no effect with tts.backend "
+                    f"{config.get('tts', {}).get('backend')!r} (only local); rendering per sentence")
     if ready is not None:
         ready.set()
     async with server:

@@ -22,6 +22,10 @@ main.py say_server / say_request / play_say):
 - staged announce: optional filler + think_s + delay_s (THINKING held, mic
   closed between parts, both lines in say.log; interrupt aborts the rest;
   a second /say during the sequence gets 409).
+- say.render: whole (tts.backend local only): every sentence of a part is
+  rendered before the first is sent; the answer renders during the
+  filler/think phase, THINKING stays on until it is ready; a tap during
+  the render sends nothing; sentence (default) and local_stream unchanged.
 
 Reuses the stubs of tests/test_pause_flush.py. Run from the repo root:
 python3 tests/test_say.py
@@ -168,8 +172,9 @@ async def http(port, method, path, obj=None, headers=None, raw=None):
 class Env:
     """Fake pod + say server + fakes installed in pipeline.main."""
 
-    def __init__(self, devices=None, queue=None, **say_extra):
+    def __init__(self, devices=None, queue=None, tts_backend=None, **say_extra):
         self.devices = devices if devices is not None else [make_device()]
+        self.tts_backend = tts_backend
         self.queue = queue if queue is not None else asyncio.Queue()
         self.say_extra = say_extra
 
@@ -182,6 +187,8 @@ class Env:
         self.log_path = os.path.join(self.tmp, "say.log")
         self.port = free_port()
         self.config = make_config(self.pod.port, self.port, self.log_path, **self.say_extra)
+        if self.tts_backend:
+            self.config["tts"] = {"backend": self.tts_backend}
         m.tts.synthesize_stream = self.tts.synthesize_stream
         m.open_audio_connection = proto.open_audio_connection
         m.write_audio_frames = proto.write_audio_frames
@@ -618,6 +625,153 @@ async def test_staged():
 
 
 
+def test_render_mode():
+    """say.render: sentence by default; whole only with tts.backend local."""
+    c = say.SayConfig({})
+    check("render: default is sentence", c.render == "sentence", c.render)
+    check("render: unknown value falls back to sentence",
+          say.SayConfig({"render": "bogus"}).render == "sentence")
+    w = say.SayConfig({"render": " Whole "})
+    check("render: whole parsed", w.render == "whole", w.render)
+    check("render: whole + tts local -> whole",
+          say.render_whole(w, {"tts": {"backend": "local"}}) is True)
+    check("render: whole + local_stream / elevenlabs / no tts -> per sentence",
+          not say.render_whole(w, {"tts": {"backend": "local_stream"}})
+          and not say.render_whole(w, {"tts": {"backend": "elevenlabs"}})
+          and not say.render_whole(w, {}))
+    check("render: sentence + tts local -> per sentence",
+          not say.render_whole(c, {"tts": {"backend": "local"}}))
+
+
+async def test_render_whole():
+    """render: whole renders every sentence before the first is sent."""
+    text = f"{TAG} One. Two is here. Three!"
+
+    async def run(backend, events, **say_extra):
+        async with Env(tts_backend=backend, **say_extra) as env:
+            fake_stream = env.tts.synthesize_stream
+            real_open = m.open_audio_connection
+
+            async def rec_stream(sentence, voice, config, **kw):
+                events.append(("tts", sentence))
+                async for pcm in fake_stream(sentence, voice, config, **kw):
+                    yield pcm
+
+            async def rec_open(ip, port, **kw):
+                events.append(("open", kw.get("mic_timeout")))
+                return await real_open(ip, port, **kw)
+
+            m.tts.synthesize_stream = rec_stream
+            m.open_audio_connection = rec_open
+            st, body = await http(env.port, "POST", "/say", {"text": text, "voice": "pepper"})
+            await asyncio.sleep(0.2)
+            return env, st, body
+
+    def kinds(events):
+        return [k for k, _ in events]
+
+    ev = []
+    env, st, body = await run("local", ev, render="whole")
+    check("whole: 200 played, 3/3",
+          st == 200 and body["status"] == "played" and body["played"] == 3, f"{st} {body}")
+    check("whole: all 3 sentences rendered before the first audio connection",
+          kinds(ev) == ["tts"] * 3 + ["open"] * 3, f"{ev}")
+    check("whole: 3 audio connections, mic 0, then 0xDD",
+          [c["mic"] for c in env.pod.audio()] == [0, 0, 0]
+          and env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}], f"{env.pod.conns}")
+    check("whole: TTS got each sentence once, in order, in pepper's voice",
+          [s for s, _ in env.tts.calls] == [f"{TAG} One.", "Two is here.", "Three!"]
+          and all(v == "pepper" for _, v in env.tts.calls), f"{env.tts.calls}")
+    lines = env.log_lines()
+    check("whole: one say.log line, played",
+          len(lines) == 1 and lines[0]["status"] == "played", f"{lines}")
+
+    for backend, extra, label in (("local", {}, "sentence (default)"),
+                                  ("local_stream", {"render": "whole"}, "whole + local_stream")):
+        ev = []
+        env, st, body = await run(backend, ev, **extra)
+        check(f"{label}: unchanged, render and send one sentence at a time",
+              st == 200 and body["played"] == 3
+              and kinds(ev) == ["tts", "open"] * 3, f"{st} {body} {ev}")
+
+    # Staged: the answer renders during the filler/think phase, before THINKING ends.
+    states = []
+    real_fire = m.fire_state
+    m.fire_state = lambda ip, port, state: (states.append(("state", state)),
+                                            real_fire(ip, port, state))[1]
+    try:
+        filler = f"{TAG} Hmm. Let me see."
+        async with Env(tts_backend="local", render="whole") as env:
+            fake_stream = env.tts.synthesize_stream
+            real_open = m.open_audio_connection
+
+            async def rec_stream(sentence, voice, config, **kw):
+                states.append(("tts", sentence))
+                async for pcm in fake_stream(sentence, voice, config, **kw):
+                    yield pcm
+
+            async def rec_open(ip, port, **kw):
+                states.append(("open", kw.get("mic_timeout")))
+                return await real_open(ip, port, **kw)
+
+            m.tts.synthesize_stream = rec_stream
+            m.open_audio_connection = rec_open
+            states.clear()
+            st, body = await http(env.port, "POST", "/say", {
+                "text": text, "voice": "pepper", "filler": filler, "think_s": 0.3})
+            await asyncio.sleep(0.2)
+            k = kinds(states)
+            check("whole staged: 200 played, filler 2/2, answer 3/3",
+                  st == 200 and body["status"] == "played" and body["played"] == 3
+                  and body["filler_played"] == 2, f"{st} {body}")
+            check("whole staged: filler rendered, then answer renders before THINKING ends; "
+                  "filler plays back to back, answer after THINKING",
+                  k[:2] == ["tts", "tts"] and k.count("tts") == 5
+                  and k.index("state") > max(i for i, x in enumerate(k) if x == "tts")
+                  and k[-3:] == ["open"] * 3 and k.count("open") == 5,
+                  f"{states}")
+            lines = env.log_lines()
+            check("whole staged: filler + answer logged played",
+                  len(lines) == 2 and lines[0].get("filler") and lines[1]["status"] == "played",
+                  f"{lines}")
+
+        # Slow answer render: THINKING stays on past think_s until it is ready.
+        async with Env(tts_backend="local", render="whole") as env:
+            env.tts.delay = 0.25
+            states.clear()
+            t0 = time.monotonic()
+            st, body = await http(env.port, "POST", "/say", {
+                "text": text, "voice": "pepper", "think_s": 0.1})
+            elapsed = time.monotonic() - t0
+            check("whole slow render: played after the full render (>= 3 x 0.25 s)",
+                  st == 200 and body["status"] == "played" and body["played"] == 3
+                  and elapsed >= 0.75, f"{st} {body} {elapsed:.2f}")
+            check("whole slow render: THINKING fired",
+                  ("state", 2) in states, f"{states}")
+
+        # Tap while waiting for the render: nothing sent, no 0xDD, pod released.
+        async with Env(tts_backend="local", render="whole") as env:
+            env.tts.delay = 0.5
+            dev = env.devices[0]
+
+            async def tap():
+                await asyncio.sleep(0.2)
+                dev.interrupted.set()
+
+            tap_task = asyncio.create_task(tap())
+            st, body = await http(env.port, "POST", "/say", {
+                "text": text, "voice": "pepper", "think_s": 0.1})
+            await tap_task
+            await asyncio.sleep(0.1)
+            check("whole interrupted during render: interrupted, nothing played",
+                  st == 200 and body["status"] == "interrupted" and body["played"] == 0
+                  and not env.pod.audio() and not env.pod.mic_cmds(), f"{st} {body} {env.pod.conns}")
+            check("whole interrupted during render: pod released",
+                  not dev.processing and not dev.say_active)
+    finally:
+        m.fire_state = real_fire
+
+
 async def main():
     await test_disabled()
     await test_refusals()
@@ -626,6 +780,8 @@ async def main():
     await test_no_turn_note()
     test_resolve()
     test_parse_staged()
+    test_render_mode()
+    await test_render_whole()
     for f in glob.glob(f"/tmp/tts-debug/*_{TAG}*.wav"):
         os.remove(f)
     total = len(pf.CHECKS)
