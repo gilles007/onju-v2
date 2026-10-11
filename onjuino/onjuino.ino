@@ -77,6 +77,7 @@ WiFiServer tcpServer(PORT_TCP_MESSAGING);
 
 volatile bool isPlaying = false;
 uint32_t mic_timeout = 0;
+volatile uint32_t micHoldoffUntil = 0; // millis() until which VOX sends no mic audio (see POST_PLAYBACK_MIC_HOLDOFF_MS)
 
 // LED globals that are set then ramped down by updateLedTask to create pulse effect
 volatile uint16_t ledLevel = 0;
@@ -237,6 +238,16 @@ int16_t convertedMicBuffer[SAMPLE_CHUNK_SIZE]; // For converted values to be sen
 #define MIC_OFFSET_AVERAGING_FRAMES 1
 #define DC_OFFSET_ALPHA 0.001f // IIR filter coefficient for DC offset tracking
 #define VAD_MIC_EXTEND 5000 // ensure there's always another 5s after last VAD detected by server to avoid cutting off while talking
+// (20261011 post-playback mic holdoff) VOX: after a playback ends normally, the
+// mic is read but nothing is sent for this long. Without it the pod sent its own
+// playback tail (the stale RX DMA ring, captured while playing, plus speaker /
+// room ring-down) and the server VAD + ASR turned it into "Thank you." / "Bye.".
+// The clock starts when isPlaying clears, i.e. after the 120 ms silence flush has
+// been queued behind the audio in the 4 x 32 ms TX ring, so at most ~8 ms of real
+// audio is still playing. 500 ms = 128 ms RX ring (4 x 512 @ 16 kHz) + ~370 ms of
+// ring-down margin, still short of a typical reply. A tap ends it at once;
+// PTT and tap-interrupted playback never get it.
+#define POST_PLAYBACK_MIC_HOLDOFF_MS 500
 
 // Audio compression
 #define USE_COMPRESSION true        // Enable μ-law compression (2x bandwidth reduction)
@@ -914,6 +925,14 @@ void loop()
                     }
                 }
 
+                // (20261011 post-playback mic holdoff) Set before isPlaying clears so
+                // micTask never sees the mic free without it. Skipped after a tap
+                // (interruptPlayback): the user wants to talk now.
+                if (!wasInterrupted && !interruptPlayback)
+                {
+                    micHoldoffUntil = millis() + POST_PLAYBACK_MIC_HOLDOFF_MS;
+                }
+
                 isPlaying = false;
 
                 // 20260819 LED Animation - Update state
@@ -1227,6 +1246,13 @@ void micTask(void *pvParameters)
                 Serial.println("Timeout reached");
             }
         }
+        else if (!PTT_MODE && (int32_t)(micHoldoffUntil - millis()) > 0) // VOX: post-playback holdoff
+        {
+            // Read and drop: this also empties the RX DMA ring of audio captured
+            // during playback, so the first packet sent afterwards is fresh.
+            size_t bytesRead = 0;
+            i2s_read(I2S_NUM, micBuffer, sizeof(micBuffer), &bytesRead, portMAX_DELAY);
+        }
         else
         {
             size_t bytesRead = 0;
@@ -1491,6 +1517,8 @@ bool handleShortPress()
         setLed(255, 30, 0, 255, 10);
         return false;
     }
+
+    micHoldoffUntil = 0; // (20261011) a tap opens the mic now, no post-playback holdoff
 
     if (!deviceEnabled)
     {
