@@ -55,7 +55,7 @@ _stub("pipeline.protocol", STATE_IDLE=0, STATE_THINKING=2,
       send_audio=_anoop, send_state=_anoop, send_led_blink=_anoop,
       open_led_connection=_anoop, write_led_blink=_noop, close_led_connection=_anoop,
       open_audio_connection=_anoop, write_audio_frames=_noop, close_audio_connection=_anoop,
-      send_stop_listening=_anoop)
+      send_stop_listening=_anoop, send_mic_holdoff=_anoop, MIC_HOLDOFF_MAX_MS=2000)
 _services = _stub("pipeline.services")
 _services.asr = _stub("pipeline.services.asr", transcribe=_anoop)
 _services.tts = _stub("pipeline.services.tts", synthesize_stream=_noop)

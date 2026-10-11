@@ -78,6 +78,7 @@ WiFiServer tcpServer(PORT_TCP_MESSAGING);
 volatile bool isPlaying = false;
 uint32_t mic_timeout = 0;
 volatile uint32_t micHoldoffUntil = 0; // millis() until which VOX sends no mic audio (see POST_PLAYBACK_MIC_HOLDOFF_MS)
+uint16_t postPlaybackMicHoldoffMs; // (20261011) current holdoff; boot default POST_PLAYBACK_MIC_HOLDOFF_MS, set by 0xEF id 1
 
 // LED globals that are set then ramped down by updateLedTask to create pulse effect
 volatile uint16_t ledLevel = 0;
@@ -244,10 +245,20 @@ int16_t convertedMicBuffer[SAMPLE_CHUNK_SIZE]; // For converted values to be sen
 // room ring-down) and the server VAD + ASR turned it into "Thank you." / "Bye.".
 // The clock starts when isPlaying clears, i.e. after the 120 ms silence flush has
 // been queued behind the audio in the 4 x 32 ms TX ring, so at most ~8 ms of real
-// audio is still playing. 500 ms = 128 ms RX ring (4 x 512 @ 16 kHz) + ~370 ms of
-// ring-down margin, still short of a typical reply. A tap ends it at once;
-// PTT and tap-interrupted playback never get it.
-#define POST_PLAYBACK_MIC_HOLDOFF_MS 500
+// audio is still playing. It must cover the 128 ms RX ring (4 x 512 @ 16 kHz)
+// plus some ring-down margin, and stay short of a typical reply. A tap ends it
+// at once; PTT and tap-interrupted playback never get it.
+// (20261011 0xEF device settings) This is now only the boot default: the server
+// can set it with 0xEF setting id 1 (device.mic_holdoff_ms in the pipeline
+// config), sent each time the pod announces itself. 256 ms (128 ms ring + 128 ms
+// ring-down) for normal use; 512 ms is the conservative value for filming.
+#define POST_PLAYBACK_MIC_HOLDOFF_MS 256
+#define MIC_HOLDOFF_MAX_MS 2000            // 0xEF values above this are clamped
+#define SETTING_POST_PLAYBACK_MIC_HOLDOFF 1 // 0xEF setting id (pipeline/protocol.py SETTING_MIC_HOLDOFF)
+// (20261011) Unknown TCP commands are logged and skipped. This many unknown
+// headers in a row on one connection means the stream is out of sync (not a
+// newer command), so the connection is dropped as before.
+#define MAX_CONSECUTIVE_UNKNOWN_COMMANDS 4
 
 // Audio compression
 #define USE_COMPRESSION true        // Enable μ-law compression (2x bandwidth reduction)
@@ -388,6 +399,7 @@ bool playAndMeter(const int32_t *buf, size_t n)
 void setup()
 {
     Serial.begin(115200);
+    postPlaybackMicHoldoffMs = POST_PLAYBACK_MIC_HOLDOFF_MS; // (20261011) boot default, 0xEF id 1 overrides
 
     leds.begin();
     leds.show();
@@ -725,6 +737,20 @@ void loop()
         }
 
         // Persistent connection loop: process commands until disconnect or timeout
+        /*
+        (20261011) Command framing rule. Every command starts with a fixed 6-byte
+        header. 0xAA (audio) is the ONLY command followed by a payload (the audio
+        stream, until the server closes the connection); all the others (0xBB,
+        0xCC, 0xDD, 0xEE, 0xEF) are header-only. An unknown command is therefore
+        logged and skipped (its 6 bytes are already read, so the stream stays in
+        sync) and the connection stays open: a server with a newer command does
+        not break a pod that has not been reflashed. Rule: any FUTURE command must
+        be header-only (6 bytes, no payload) for this to keep working. A payload,
+        even with its length in the header, would be read by older firmware as
+        more headers (it only skips 6 bytes); new data goes in a new command or a
+        new 0xEF setting id instead.
+        */
+        uint8_t unknownInARow = 0;
         while (client.connected() || client.available())
         {
             // Wait for 6-byte header (500ms timeout for responsive disconnect detection)
@@ -930,7 +956,7 @@ void loop()
                 // (interruptPlayback): the user wants to talk now.
                 if (!wasInterrupted && !interruptPlayback)
                 {
-                    micHoldoffUntil = millis() + POST_PLAYBACK_MIC_HOLDOFF_MS;
+                    micHoldoffUntil = millis() + postPlaybackMicHoldoffMs;
                 }
 
                 isPlaying = false;
@@ -1034,12 +1060,48 @@ void loop()
                 }
             }
 
+            /*
+            header[0]   0xEF for device settings (20261011)
+            header[1]   setting id: 1 = post-playback mic holdoff
+            header[2:3] value (big-endian, like the 0xAA mic timeout);
+                        id 1: holdoff in ms, clamped to 0..MIC_HOLDOFF_MAX_MS
+            header[4:5] reserved, 0
+            Unknown setting ids are logged and ignored, so new settings can be
+            added as new ids without breaking older firmware.
+            */
+            else if (header[0] == 0xEF)
+            {
+                uint8_t settingId = header[1];
+                uint16_t value = header[2] << 8 | header[3];
+                if (settingId == SETTING_POST_PLAYBACK_MIC_HOLDOFF)
+                {
+                    if (value > MIC_HOLDOFF_MAX_MS) value = MIC_HOLDOFF_MAX_MS;
+                    Serial.printf("Received setting (0xEF): post-playback mic holdoff %d -> %d ms\n",
+                                  postPlaybackMicHoldoffMs, value);
+                    postPlaybackMicHoldoffMs = value;
+                }
+                else
+                {
+                    Serial.printf("Received setting (0xEF): unknown setting id %d (value %d), ignored\n",
+                                  settingId, value);
+                }
+            }
+
             else
             {
-                Serial.println("Received unknown command");
-                setLed(255, 0, 0, 255, 6);
-                break; // unknown command, exit connection loop
+                // (20261011) Log and skip instead of flashing red and dropping
+                // the connection: see the framing rule above the loop.
+                Serial.printf("Received unknown command 0x%02X (header %02X %02X %02X %02X %02X %02X), ignored\n",
+                              header[0], header[0], header[1], header[2], header[3], header[4], header[5]);
+                if (++unknownInARow >= MAX_CONSECUTIVE_UNKNOWN_COMMANDS)
+                {
+                    Serial.println("Too many unknown commands in a row, stream out of sync: closing connection");
+                    setLed(255, 0, 0, 255, 6);
+                    break;
+                }
+                continue;
             }
+            unknownInARow = 0;
         } // end persistent connection loop
 
 tcp_cleanup:

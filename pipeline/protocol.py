@@ -116,6 +116,41 @@ async def send_state(ip: str, port: int, state: int, timeout: float = 0.2):
     await send_tcp(ip, port, header, timeout=timeout)
 
 
+# 20261011 0xEF device settings. Values for header[1] (setting id). Must
+# match SETTING_* in onjuino/onjuino.ino. New settings get new ids: older
+# firmware logs and ignores an unknown id.
+SETTING_MIC_HOLDOFF = 1     # post-playback mic holdoff (VOX), in ms
+MIC_HOLDOFF_MAX_MS = 2000   # the pod clamps to this too
+
+
+def setting_header(setting_id: int, value: int) -> bytes:
+    """Build the 6-byte 0xEF device setting header.
+
+    header[0]   0xEF for device setting
+    header[1]   setting id (SETTING_*)
+    header[2:3] value, 16-bit big-endian (same byte order as the 0xAA mic timeout)
+    header[4:5] reserved, 0
+    """
+    if not 0 <= setting_id <= 0xFF:
+        raise ValueError(f"setting id out of range: {setting_id}")
+    if not 0 <= value <= 0xFFFF:
+        raise ValueError(f"setting value out of range: {value}")
+    return bytes([0xEF, setting_id, (value >> 8) & 0xFF, value & 0xFF, 0, 0])
+
+
+async def send_setting(ip: str, port: int, setting_id: int, value: int, timeout: float = 0.2):
+    """Send a 0xEF device setting on its own short TCP connection (same style
+    as send_state: a pod that is playing queues it and applies it right after
+    that playback). Firmware older than 20261011 does not know 0xEF: it
+    flashes red and drops that one connection, nothing else."""
+    await send_tcp(ip, port, setting_header(setting_id, value), timeout=timeout)
+
+
+async def send_mic_holdoff(ip: str, port: int, holdoff_ms: int, timeout: float = 0.2):
+    """0xEF id 1: post-playback mic holdoff in ms (0..MIC_HOLDOFF_MAX_MS)."""
+    await send_setting(ip, port, SETTING_MIC_HOLDOFF, holdoff_ms, timeout=timeout)
+
+
 async def send_led_blink(ip: str, port: int, intensity: int, r: int = 255, g: int = 255, b: int = 255, fade: int = 6):
     # header[0]   0xCC for LED blink
     # header[1]   starting intensity

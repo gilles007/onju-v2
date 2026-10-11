@@ -176,6 +176,17 @@ device:
   led_update_period: 0.25
   greeting: false
   greeting_wav: "data/hello_imhere.wav"
+  # Post-playback mic holdoff (VOX pods), in ms: after the pod finishes
+  # speaking it discards mic audio for this long, so the tail of its own
+  # playback (128 ms stale mic buffer + speaker/room ring-down) is not heard
+  # as "Thank you." / "Bye.". A tap skips it; PTT never uses it. Sent to the
+  # pod (0xEF command) each time it announces itself. Unset = nothing sent,
+  # the pod keeps its firmware default of 256 ms. Range 0..2000.
+  # 64 / 128: too short to clear the 128 ms stale buffer, not recommended.
+  # 256: normal use.  512: conservative, for filming.
+  # Firmware older than 20261011 does not know 0xEF: it flashes red once and
+  # drops that one connection (harmless), so leave this unset until reflashed.
+  # mic_holdoff_ms: 256
 
 logging:
   level: "INFO"
