@@ -10,6 +10,7 @@ HTTP server (main.py say_server), off unless the config enables it:
       token: ""             # optional; then send "Authorization: Bearer <token>"
       log: "/tmp/tts-debug/say.log"
       tell_agent: true      # pass the text to the agent's next turn
+      render: sentence      # or whole (tts.backend local only), see below
 
 Request (JSON):
     {"text": "...",            required (the answer)
@@ -26,6 +27,16 @@ Request (JSON):
 Staged sequence when filler and/or think_s is set: optional delay → filler →
 THINKING for think_s → answer. Plain announces (text only) are unchanged.
 listen applies only after the final answer; the mic stays closed between parts.
+
+render (2026-10-11): "sentence" (default) renders and sends one sentence at
+a time, like a voice turn. "whole" renders all of a part's sentences first,
+then sends them back to back, so a slow whole-sentence TTS (backend local,
+Qwen slower than real time) leaves no gaps between sentences. The renders
+start when the say starts (filler first, then the answer), so delay_s, the
+filler and think_s hide the answer's render time; THINKING stays on past
+think_s until it is ready. Only with tts.backend local: local_stream is there
+to start speaking early, so "whole" is ignored there (warned at startup).
+Voice turns never use it.
 
 Responses: 200 {"status": "played"|"queued"|"interrupted", "duration_s", ...}
 ("played" = all audio sent; the pod is still playing the last ~duration_s);
@@ -52,6 +63,7 @@ DEFAULT_PORT = 3103
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_LOG = "/tmp/tts-debug/say.log"
 DEFAULT_MAX_CHARS = 1500
+RENDER_MODES = ("sentence", "whole")
 # The pod streams mic packets all the time its mic is open (the server runs
 # the VAD), so packets within this window mean it is listening.
 LISTEN_GRACE_S = 1.5
@@ -84,10 +96,20 @@ class SayConfig:
         self.log_path = str(cfg.get("log") or DEFAULT_LOG)
         self.tell_agent = bool(cfg.get("tell_agent", True))
         self.max_chars = int(cfg.get("max_chars") or DEFAULT_MAX_CHARS)
+        self.render = str(cfg.get("render") or "sentence").strip().lower()
+        if self.render not in RENDER_MODES:
+            log.warning(f"SAY  unknown say.render {self.render!r}; using \"sentence\"")
+            self.render = "sentence"
 
     @classmethod
     def from_config(cls, config: dict) -> "SayConfig":
         return cls(config.get("say"))
+
+
+def render_whole(scfg: SayConfig, config: dict) -> bool:
+    """True when a say renders each part in full before playing it:
+    say.render is "whole" and tts.backend is "local" (one WAV per sentence)."""
+    return scfg.render == "whole" and (config.get("tts") or {}).get("backend") == "local"
 
 
 # ---- request -----------------------------------------------------------

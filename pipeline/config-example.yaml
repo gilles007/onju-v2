@@ -184,6 +184,9 @@ network:
 #   token: ""                                # optional: then send "Authorization: Bearer <token>"
 #   log: "/tmp/tts-debug/say.log"            # JSON lines: time, device, bot, voice, status, text
 #   tell_agent: true                         # the agent's next turn on that pod is told what it "said"
+#   render: sentence                         # sentence (default): render+play one sentence at a time;
+#                                            # whole: render all sentences, then play them back to back
+#                                            # (no gaps); only with tts.backend local, ignored otherwise
 
 audio:
   sample_rate: 16000
