@@ -19,7 +19,7 @@ from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload,
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, send_stop_listening
+from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, send_stop_listening, send_mic_holdoff, MIC_HOLDOFF_MAX_MS
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
@@ -189,7 +189,69 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
                 await utterance_queue.put((device, utterance))
 
 
+def mic_holdoff_ms(config: dict) -> int | None:
+    """device.mic_holdoff_ms from the config, or None when unset or invalid
+    (then nothing is sent and the pod keeps its firmware default, 256 ms)."""
+    value = (config.get("device") or {}).get("mic_holdoff_ms")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        log.warning(f"device.mic_holdoff_ms must be a whole number of ms >= 0, got {value!r}: not sent")
+        return None
+    if value > MIC_HOLDOFF_MAX_MS:
+        log.warning(f"device.mic_holdoff_ms {value} above {MIC_HOLDOFF_MAX_MS}: clamped")
+        value = MIC_HOLDOFF_MAX_MS
+    return value
+
+
+async def _send_setting_after(prev: asyncio.Task | None, ip: str, port: int, holdoff: int):
+    if prev is not None and not prev.done():
+        await asyncio.wait({prev})   # wait for it without cancelling it
+    try:
+        await asyncio.wait_for(send_mic_holdoff(ip, port, holdoff, timeout=STATE_TIMEOUT_S),
+                               STATE_TIMEOUT_S + 0.3)
+    except Exception as e:
+        log.debug(f"DEVICE mic holdoff to {ip} failed: {e!r}")
+
+
+def send_device_settings(device: Device, config: dict) -> asyncio.Task | None:
+    """(20261011) Send the 0xEF device settings to a pod that just announced
+    itself, in the background (fire-and-forget, like fire_state: own short
+    connection, chained behind any pending state send to that pod, errors
+    only logged at debug). Called after the greeting has been handed to the
+    pod, so it never delays the greeting or the first turn; a pod that is
+    still playing queues it and applies it after that playback.
+    Nothing is sent when device.mic_holdoff_ms is unset."""
+    holdoff = mic_holdoff_ms(config)
+    if holdoff is None:
+        return None
+    ip = device.ip
+    port = config["network"]["tcp_port"]
+    log.info(f"DEVICE  {device.hostname} mic holdoff {holdoff} ms")
+    task = asyncio.create_task(_send_setting_after(_state_tail.get(ip), ip, port, holdoff))
+    _state_tasks.add(task)
+    _state_tail[ip] = task
+
+    def _done(t: asyncio.Task):
+        _state_tasks.discard(t)
+        if _state_tail.get(ip) is t:
+            del _state_tail[ip]
+    task.add_done_callback(_done)
+    return task
+
+
 async def greet_device(device: Device, config: dict):
+    """Send greeting to a device, then its 0xEF settings (send_device_settings)."""
+    try:
+        await _send_greeting(device, config)
+    finally:
+        try:
+            send_device_settings(device, config)
+        except Exception as e:
+            log.debug(f"DEVICE settings for {device.hostname} not sent: {e!r}")
+
+
+async def _send_greeting(device: Device, config: dict):
     """Send greeting to a device. Always sends LED pulse for IP registration."""
     dev_cfg = config["device"]
     tcp_port = config["network"]["tcp_port"]
