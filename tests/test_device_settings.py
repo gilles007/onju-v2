@@ -10,6 +10,9 @@ post-playback mic holdoff is sent to a pod when it announces itself.
   (or invalid); when set it is sent once, after the LED pulse / greeting,
   values above 2000 are clamped; a slow or hanging send never holds up
   greet_device; it is chained behind a pending 0xEE state send to that pod.
+- (20261012) setting id 2, the playback pre-buffer (device.prebuffer_ms,
+  64..30000 ms): header bytes, not sent when unset/invalid, clamping, sent
+  after the holdoff when both are set.
 
 Reuses the module stubs of tests/test_pause_flush.py (no network except a
 local socket, no audio hardware). Run from the repo root:
@@ -34,11 +37,13 @@ proto = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(proto)
 
 
-def make_config(holdoff="unset"):
+def make_config(holdoff="unset", prebuffer="unset"):
     cfg = pf.make_config()
     cfg["device"]["greeting"] = False
     if holdoff != "unset":
         cfg["device"]["mic_holdoff_ms"] = holdoff
+    if prebuffer != "unset":
+        cfg["device"]["prebuffer_ms"] = prebuffer
     return cfg
 
 
@@ -62,11 +67,15 @@ class Log:
             await asyncio.sleep(self.holdoff_delay)
         self.events.append(("holdoff", ip, port, ms, timeout))
 
+    async def send_prebuffer(self, ip, port, ms, timeout=0.2):
+        self.events.append(("prebuffer", ip, port, ms, timeout))
+
 
 def install(log):
     m.send_led_blink = log.send_led_blink
     m.send_state = log.send_state
     m.send_mic_holdoff = log.send_mic_holdoff
+    m.send_prebuffer = log.send_prebuffer
 
 
 async def settle():
@@ -76,11 +85,11 @@ async def settle():
         await asyncio.sleep(0.02)
 
 
-async def greet(holdoff="unset", log=None):
+async def greet(holdoff="unset", log=None, prebuffer="unset"):
     log = log or Log()
     install(log)
     dev = pf.make_device(None)
-    await m.greet_device(dev, make_config(holdoff))
+    await m.greet_device(dev, make_config(holdoff, prebuffer))
     await settle()
     return log
 
@@ -178,6 +187,54 @@ async def main():
     await settle()
     check("ordered after a pending 0xEE state",
           [e[0] for e in log.events] == ["blink", "state", "holdoff"], f"{log.events}")
+
+    # 7. (20261012) Setting id 2: playback pre-buffer.
+    check("id 2 = prebuffer, range 64..30000 ms",
+          proto.SETTING_PREBUFFER == 2 and proto.PREBUFFER_MIN_MS == 64 and proto.PREBUFFER_MAX_MS == 30000)
+    check("header: prebuffer 15000 ms -> EF 02 3A 98 00 00",
+          proto.setting_header(proto.SETTING_PREBUFFER, 15000) == bytes([0xEF, 2, 0x3A, 0x98, 0, 0]))
+    check("header: prebuffer 1000 ms -> EF 02 03 E8 00 00",
+          proto.setting_header(2, 1000) == bytes([0xEF, 2, 0x03, 0xE8, 0, 0]))
+    check("header: prebuffer 30000 ms -> EF 02 75 30 00 00",
+          proto.setting_header(2, 30000) == bytes([0xEF, 2, 0x75, 0x30, 0, 0]))
+    got = []
+
+    async def handle2(reader, writer):
+        got.append(await reader.read())
+        writer.close()
+    server = await asyncio.start_server(handle2, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    await proto.send_prebuffer("127.0.0.1", port, 15000)
+    await asyncio.sleep(0.05)
+    server.close()
+    await server.wait_closed()
+    check("real send_prebuffer: EF 02 3A 98 00 00 on its own connection",
+          got == [bytes([0xEF, 2, 0x3A, 0x98, 0, 0])], f"{got}")
+    check("prebuffer unset: None", m.prebuffer_ms(make_config()) is None and m.prebuffer_ms({}) is None)
+    log = await greet()
+    check("both unset: only the LED pulse", [e[0] for e in log.events] == ["blink"], f"{log.events}")
+    for bad in ("15000", -1, 1.5, True, None):
+        log = await greet(prebuffer=bad)
+        check(f"prebuffer invalid {bad!r}: not sent", [e[0] for e in log.events] == ["blink"], f"{log.events}")
+    log = await greet(prebuffer=15000)
+    check("prebuffer 15000 alone: sent after the LED pulse, no holdoff",
+          log.events == [("blink", "127.0.0.1", 3001), ("prebuffer", "127.0.0.1", 3001, 15000, m.STATE_TIMEOUT_S)],
+          f"{log.events}")
+    log = await greet(prebuffer=10)
+    check("prebuffer 10: clamped up to 64", log.events[-1][:4] == ("prebuffer", "127.0.0.1", 3001, 64), f"{log.events}")
+    log = await greet(prebuffer=60000)
+    check("prebuffer 60000: clamped to 30000", log.events[-1][:4] == ("prebuffer", "127.0.0.1", 3001, 30000), f"{log.events}")
+    log = await greet(512, prebuffer=15000)
+    check("both set: holdoff then prebuffer",
+          [e[:4] for e in log.events] == [("blink", "127.0.0.1", 3001), ("holdoff", "127.0.0.1", 3001, 512),
+                                          ("prebuffer", "127.0.0.1", 3001, 15000)], f"{log.events}")
+    log = Log()
+    install(log)
+    m.send_mic_holdoff = boom
+    await m.greet_device(pf.make_device(None), make_config(512, 15000))
+    await settle()
+    check("holdoff send fails: prebuffer still sent",
+          [e[0] for e in log.events] == ["blink", "prebuffer"], f"{log.events}")
 
     total = len(pf.CHECKS)
     print(f"{total - len(pf.FAILS)}/{total} passed")

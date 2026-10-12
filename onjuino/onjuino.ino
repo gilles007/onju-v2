@@ -220,8 +220,23 @@ int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playb
 // 4*rttvar); the old 256 ms pre-buffer + 128 ms DMA ring (~0.4 s) underran and the
 // DMA ring replayed its last buffers ("A Cris is is is"). 1 s covers one RTO.
 // Streams that end before the threshold are still played (flushed at stream end).
+// (20261012 0xEF pre-buffer) On PSRAM boards the threshold is set by the server
+// with 0xEF setting id 2 (device.prebuffer_ms), PREBUFFER_MIN_MS..PREBUFFER_MAX_MS.
+// wavData is ONE linear block (not a ring): samples accumulate from index 0 until
+// the threshold, the whole block is queued to I2S, then each further TCP read /
+// Opus frame is queued as it arrives (totalSamplesRead back to 0 each time). So
+// wavData only ever needs threshold + one read/frame of headroom, and it is
+// allocated once at boot for PREBUFFER_MAX_MS: changing the setting never
+// reallocates. A stream shorter than the threshold is fully downloaded, then
+// played at stream end (effectively WAV playback, no Wi-Fi underrun possible);
+// a longer stream starts at the threshold and keeps streaming as before.
+// Non-PSRAM builds keep the fixed 64 ms and ignore id 2.
+#define PREBUFFER_DEFAULT_MS 1000
+#define PREBUFFER_MIN_MS 64
+#define PREBUFFER_MAX_MS 30000 // 480000 samples * 4 B = 1.83 MB of the 8 MB PSRAM
+#define SETTING_PREBUFFER 2    // 0xEF setting id (pipeline/protocol.py SETTING_PREBUFFER)
 #ifdef USE_PSRAM
-int bufferThreshold = 16000; // 1000ms @ 16kHz (50 frames @ 20ms)
+volatile int bufferThreshold = PREBUFFER_DEFAULT_MS * 16; // 1000ms @ 16kHz (50 frames @ 20ms)
 #else
 int bufferThreshold = 1024;  // 64ms @ 16kHz (3.2 frames @ 20ms)
 #endif
@@ -596,7 +611,9 @@ void setup()
     Serial.println("PSRAM total: " + String(total_psram));
     Serial.println("PSRAM used: " + String(total_psram - free_psram));
 
-    wavData = (int32_t *)ps_malloc((2 * 1024 * 1024) / sizeof(int32_t));
+    // (20261012) sized for the largest pre-buffer (0xEF id 2) + one Opus frame or
+    // PCM read of headroom (previously a fixed 2 MB, which also covered 30 s).
+    wavData = (int32_t *)ps_malloc((PREBUFFER_MAX_MS * 16 + OPUS_FRAME_SIZE + tcpBufferSize / 2) * sizeof(int32_t));
     if (wavData == NULL)
     {
         Serial.println("Memory allocation failed!");
@@ -1062,9 +1079,12 @@ void loop()
 
             /*
             header[0]   0xEF for device settings (20261011)
-            header[1]   setting id: 1 = post-playback mic holdoff
+            header[1]   setting id: 1 = post-playback mic holdoff,
+                        2 = playback pre-buffer (20261012)
             header[2:3] value (big-endian, like the 0xAA mic timeout);
                         id 1: holdoff in ms, clamped to 0..MIC_HOLDOFF_MAX_MS
+                        id 2: pre-buffer in ms, clamped to
+                              PREBUFFER_MIN_MS..PREBUFFER_MAX_MS (PSRAM only)
             header[4:5] reserved, 0
             Unknown setting ids are logged and ignored, so new settings can be
             added as new ids without breaking older firmware.
@@ -1079,6 +1099,21 @@ void loop()
                     Serial.printf("Received setting (0xEF): post-playback mic holdoff %d -> %d ms\n",
                                   postPlaybackMicHoldoffMs, value);
                     postPlaybackMicHoldoffMs = value;
+                }
+                else if (settingId == SETTING_PREBUFFER)
+                {
+#ifdef USE_PSRAM
+                    // (20261012) Takes effect from the next stream. Settings are
+                    // handled in this loop between playbacks, never mid-stream.
+                    if (value < PREBUFFER_MIN_MS) value = PREBUFFER_MIN_MS;
+                    if (value > PREBUFFER_MAX_MS) value = PREBUFFER_MAX_MS;
+                    Serial.printf("Received setting (0xEF): pre-buffer %d -> %d ms\n",
+                                  bufferThreshold / 16, value);
+                    bufferThreshold = value * 16;
+#else
+                    Serial.printf("Received setting (0xEF): pre-buffer %d ms ignored (no PSRAM, fixed %d ms)\n",
+                                  value, bufferThreshold / 16);
+#endif
                 }
                 else
                 {

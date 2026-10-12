@@ -200,6 +200,40 @@ device:
   # it flashes red once and drops that one connection (harmless), so leave
   # this unset until the pods are reflashed.
   # mic_holdoff_ms: 256
+  #
+  # prebuffer_ms: how much audio the pod buffers before it starts playing
+  # each stream (each sentence / WAV the server sends it).
+  #
+  # Why it exists (added 2026-10-12): the pod plays audio as it arrives over
+  # Wi-Fi, from a 1 s buffer. When a Wi-Fi packet is lost, TCP stalls until it
+  # is resent; a stall longer than the buffer runs it dry and you hear a
+  # silent gap ("underrun") in the middle of a sentence. Filming on a lossy
+  # pod link (~20% loss measured) made that happen a lot.
+  #
+  # What it does: the pod waits until it holds this much audio (or the stream
+  # ends) before it starts playing. A stream SHORTER than the buffer is fully
+  # downloaded first and then played from memory: effectively WAV-file
+  # playback, a Wi-Fi hiccup can only delay its start, never cut into it. A
+  # stream longer than the buffer starts once the buffer is full and keeps
+  # streaming the rest, exactly as with the 1 s default.
+  #
+  # Trade-off: it delays the START of every stream by up to this much, normal
+  # voice replies included, and it defeats tts.backend local_stream (which
+  # exists to start speaking early). Use large values only for filming /
+  # announces, with tts.backend local + say.render whole (every sentence is
+  # rendered before it is sent, so it arrives fast and plays back to back).
+  #
+  # How it gets to the pod: 0xEF settings command, setting id 2, sent each
+  # time a pod announces itself (with mic_holdoff_ms). Unset = nothing is sent
+  # and the pod keeps 1000 ms. Range 64..30000 ms (both server and pod clamp);
+  # 30 s is what the pod's buffer is sized for (~1.9 MB of its 8 MB PSRAM).
+  #   unset / 1000   normal use (firmware default)
+  #   15000          filming: any sentence under 15 s plays gap-free
+  # Needs firmware from 2026-10-12 or later. Firmware from 2026-10-11 logs and
+  # ignores unknown setting ids (harmless, keeps 1000 ms). Firmware older than
+  # 2026-10-11 doesn't know 0xEF: it flashes red once and drops that one
+  # connection.
+  # prebuffer_ms: 1000
 
 logging:
   level: "INFO"
