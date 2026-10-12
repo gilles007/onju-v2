@@ -121,6 +121,9 @@ async def send_state(ip: str, port: int, state: int, timeout: float = 0.2):
 # firmware logs and ignores an unknown id.
 SETTING_MIC_HOLDOFF = 1     # post-playback mic holdoff (VOX), in ms
 MIC_HOLDOFF_MAX_MS = 2000   # the pod clamps to this too
+SETTING_PREBUFFER = 2       # (20261012) playback pre-buffer, in ms
+PREBUFFER_MIN_MS = 64       # the pod clamps to this range too
+PREBUFFER_MAX_MS = 30000
 
 
 def setting_header(setting_id: int, value: int) -> bytes:
@@ -149,6 +152,11 @@ async def send_setting(ip: str, port: int, setting_id: int, value: int, timeout:
 async def send_mic_holdoff(ip: str, port: int, holdoff_ms: int, timeout: float = 0.2):
     """0xEF id 1: post-playback mic holdoff in ms (0..MIC_HOLDOFF_MAX_MS)."""
     await send_setting(ip, port, SETTING_MIC_HOLDOFF, holdoff_ms, timeout=timeout)
+
+
+async def send_prebuffer(ip: str, port: int, prebuffer_ms: int, timeout: float = 0.2):
+    """(20261012) 0xEF id 2: playback pre-buffer in ms (PREBUFFER_MIN_MS..PREBUFFER_MAX_MS)."""
+    await send_setting(ip, port, SETTING_PREBUFFER, prebuffer_ms, timeout=timeout)
 
 
 async def send_led_blink(ip: str, port: int, intensity: int, r: int = 255, g: int = 255, b: int = 255, fade: int = 6):

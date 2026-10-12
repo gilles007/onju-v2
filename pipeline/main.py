@@ -19,7 +19,7 @@ from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload,
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, send_stop_listening, send_mic_holdoff, MIC_HOLDOFF_MAX_MS
+from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, send_stop_listening, send_mic_holdoff, MIC_HOLDOFF_MAX_MS, send_prebuffer, PREBUFFER_MIN_MS, PREBUFFER_MAX_MS
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
@@ -204,14 +204,40 @@ def mic_holdoff_ms(config: dict) -> int | None:
     return value
 
 
-async def _send_setting_after(prev: asyncio.Task | None, ip: str, port: int, holdoff: int):
+def prebuffer_ms(config: dict) -> int | None:
+    """(20261012) device.prebuffer_ms from the config, or None when unset or
+    invalid (then nothing is sent and the pod keeps its 1000 ms default).
+    Clamped to PREBUFFER_MIN_MS..PREBUFFER_MAX_MS."""
+    value = (config.get("device") or {}).get("prebuffer_ms")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        log.warning(f"device.prebuffer_ms must be a whole number of ms >= 0, got {value!r}: not sent")
+        return None
+    if value < PREBUFFER_MIN_MS:
+        log.warning(f"device.prebuffer_ms {value} below {PREBUFFER_MIN_MS}: clamped")
+        value = PREBUFFER_MIN_MS
+    if value > PREBUFFER_MAX_MS:
+        log.warning(f"device.prebuffer_ms {value} above {PREBUFFER_MAX_MS}: clamped")
+        value = PREBUFFER_MAX_MS
+    return value
+
+
+async def _send_setting_after(prev: asyncio.Task | None, ip: str, port: int,
+                              holdoff: int | None, prebuffer: int | None = None):
     if prev is not None and not prev.done():
         await asyncio.wait({prev})   # wait for it without cancelling it
-    try:
-        await asyncio.wait_for(send_mic_holdoff(ip, port, holdoff, timeout=STATE_TIMEOUT_S),
-                               STATE_TIMEOUT_S + 0.3)
-    except Exception as e:
-        log.debug(f"DEVICE mic holdoff to {ip} failed: {e!r}")
+    # Looked up at call time (module globals) so tests can stub them.
+    sends = []
+    if holdoff is not None:
+        sends.append(("mic holdoff", lambda: send_mic_holdoff(ip, port, holdoff, timeout=STATE_TIMEOUT_S)))
+    if prebuffer is not None:
+        sends.append(("prebuffer", lambda: send_prebuffer(ip, port, prebuffer, timeout=STATE_TIMEOUT_S)))
+    for name, make in sends:   # each on its own short connection; one failing doesn't stop the next
+        try:
+            await asyncio.wait_for(make(), STATE_TIMEOUT_S + 0.3)
+        except Exception as e:
+            log.debug(f"DEVICE {name} to {ip} failed: {e!r}")
 
 
 def send_device_settings(device: Device, config: dict) -> asyncio.Task | None:
@@ -221,14 +247,19 @@ def send_device_settings(device: Device, config: dict) -> asyncio.Task | None:
     only logged at debug). Called after the greeting has been handed to the
     pod, so it never delays the greeting or the first turn; a pod that is
     still playing queues it and applies it after that playback.
-    Nothing is sent when device.mic_holdoff_ms is unset."""
+    Nothing is sent for a setting that is unset (device.mic_holdoff_ms,
+    device.prebuffer_ms (20261012)); nothing at all when both are unset."""
     holdoff = mic_holdoff_ms(config)
-    if holdoff is None:
+    prebuffer = prebuffer_ms(config)
+    if holdoff is None and prebuffer is None:
         return None
     ip = device.ip
     port = config["network"]["tcp_port"]
-    log.info(f"DEVICE  {device.hostname} mic holdoff {holdoff} ms")
-    task = asyncio.create_task(_send_setting_after(_state_tail.get(ip), ip, port, holdoff))
+    if holdoff is not None:
+        log.info(f"DEVICE  {device.hostname} mic holdoff {holdoff} ms")
+    if prebuffer is not None:
+        log.info(f"DEVICE  {device.hostname} prebuffer {prebuffer} ms")
+    task = asyncio.create_task(_send_setting_after(_state_tail.get(ip), ip, port, holdoff, prebuffer))
     _state_tasks.add(task)
     _state_tail[ip] = task
 
