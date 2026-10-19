@@ -261,5 +261,8 @@ logging:
 # YYYYMMDD-HHMMSS_<voice>_<first 30 characters>.wav, with "__" before the
 # text for a stall or filler line (same second: -2, -3 ... added). The time is local:
 # the TZ env var's zone if set, else debug.tz, else America/Los_Angeles.
+# debug.save_wavs: false writes no debug WAVs at all (default true). A say
+# with a pre-rendered "wav" never saves one (the caller has the file).
 # debug:
 #   tz: "America/Los_Angeles"
+#   save_wavs: true
