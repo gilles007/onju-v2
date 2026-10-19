@@ -839,6 +839,8 @@ async def test_wav():
         check("wav: one audio connection, 2 batches of 0.5 s, mic 0 then 0xDD 0",
               len(audio) == 1 and audio[0]["frames"] == 2 and audio[0]["mic"] == 0
               and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd"], f"{env.pod.conns}")
+        check("wav: no /tmp/tts-debug WAV for the wav input, INFO line instead",
+              not glob.glob(f"/tmp/tts-debug/*{TAG}_from_a_file*.wav"))
         lines = env.log_lines()
         check("wav: say.log has the text label, pod released",
               len(lines) == 1 and lines[0]["text"] == f"{TAG} from a file."
@@ -855,6 +857,9 @@ async def test_wav():
               st == 200 and [c for c, _ in env.tts.calls] == [f"{TAG} one sec."]
               and [c["mic"] for c in audio] == [0, MIC] and audio[1]["frames"] == 2,
               f"{st} {body} {env.tts.calls} {env.pod.conns}")
+        check("wav + filler: the TTS filler's debug WAV is still saved",
+              bool(glob.glob(f"/tmp/tts-debug/*{TAG}_one_sec*.wav")),
+              f"{glob.glob('/tmp/tts-debug/*Zzpf*')}")
         check("wav without text: labelled [wav 1.0s] in say.log",
               any(x["text"] == "[wav 1.0s]" for x in lines), f"{lines}")
 
