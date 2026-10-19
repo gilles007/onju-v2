@@ -530,7 +530,8 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
                           turn_t0: float, tts_kwargs: dict | None = None,
                           mic_timeout: int | None = None,
                           stall: bool = False,
-                          pcm: list[bytes] | None = None) -> tuple[bool, int]:
+                          pcm: list[bytes] | None = None,
+                          save_debug: bool = True) -> tuple[bool, int]:
     """Synthesize, encode, and stream one sentence over a single
     TCP connection. Opus frames are written as the TTS produces
     audio; the end-of-speech marker (frame length 0) and closing the
@@ -703,7 +704,10 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
              f"to {device.ip} "
              f"({'final' if is_final else 'partial'}: {sentence!r})")
 
-    # Debug dump
+    # Debug dump (not for a say "wav": that audio is the caller's own file)
+    if not save_debug:
+        log.info(f"DEBUG  not saved (say wav input)")
+        return True, n_frames
     import pathlib, wave as _wave
     _dbg_dir = pathlib.Path("/tmp/tts-debug")
     _dbg_dir.mkdir(exist_ok=True)
@@ -1305,7 +1309,8 @@ async def _say_render(config: dict, device, sentences: list[str], tts_kwargs: di
 async def _say_stream_part(config: dict, device, sentences: list[str], *,
                            t0: float, tts_kwargs: dict, listen: bool,
                            stall: bool = False,
-                           rendered: list[list[bytes]] | None = None) -> tuple[bool, int, int]:
+                           rendered: list[list[bytes]] | None = None,
+                           save_debug: bool = True) -> tuple[bool, int, int]:
     """Stream sentences; listen only on the last if listen. Returns
     (ok, frames, played_count). stall: filler lines (debug WAV name only).
     rendered: audio from _say_render (say render: whole), one entry per
@@ -1320,7 +1325,8 @@ async def _say_stream_part(config: dict, device, sentences: list[str], *,
         ok, n = await stream_sentence(config, device, sentence, is_final=last,
                                       turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic,
                                       stall=stall,
-                                      pcm=rendered[i] if i < len(rendered) else None)
+                                      pcm=rendered[i] if i < len(rendered) else None,
+                                      save_debug=save_debug)
         frames += n
         if not ok:
             break
@@ -1422,7 +1428,8 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
             ok, n, played = await _say_stream_part(
                 config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen,
                 rendered=([answer_pcm] if answer_pcm is not None
-                          else answer_render.result() if answer_render else None))
+                          else answer_render.result() if answer_render else None),
+                save_debug=answer_pcm is None)
             frames += n
         # Mic: every sentence sent with mic timeout 0 (all of them unless
         # listen) is followed by a 0xDD 0 in stream_sentence: firmware before
