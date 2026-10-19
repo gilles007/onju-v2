@@ -1531,7 +1531,7 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
             said_f = (filler_text if filler_played == len(filler_sentences)
                       else " ".join(filler_sentences[:filler_played]))
             say_mod.MEMORY.add(device.hostname, bot, said_f, filler=True)
-        if played:
+        if played and tell:     # a wav without "text" has nothing to tell
             said = (text if played == len(sentences)
                     else " ".join(sentences[:played]))
             say_mod.MEMORY.add(device.hostname, bot, said)

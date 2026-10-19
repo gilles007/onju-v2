@@ -873,6 +873,21 @@ async def test_wav():
               all(st == 400 and needle in err for (st, err), (_, needle) in zip(results, bad))
               and env.pod.conns == [], f"{results}")
 
+    # grok-voice tell_agent: a wav's text is remembered for the agent's next
+    # turn like a text say; a wav without text leaves nothing.
+    async with Env() as env:
+        hostname = env.devices[0].hostname
+        say.MEMORY._said.clear()
+        st, body = await http(env.port, "POST", "/say",
+                              {"wav": make_wav(0.5), "text": f"{TAG} filed line."})
+        bot = body.get("bot")
+        note = say.MEMORY.take(hostname, bot)
+        m.bargein._by_host.clear()
+        await http(env.port, "POST", "/say", {"wav": make_wav(0.5)})
+        check("wav tell_agent: text remembered for the next turn, no text -> nothing told",
+              note is not None and f"{TAG} filed line." in note
+              and say.MEMORY.take(hostname, bot) is None, f"{st} {body} {note}")
+
 
 async def main():
     await test_disabled()
