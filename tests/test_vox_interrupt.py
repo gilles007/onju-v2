@@ -7,7 +7,8 @@ pipeline/main.py):
   pod is playing, and the interrupt is logged with the pod's name, the
   speech duration, peak/average probability and the playback state;
 - speech while nothing is playing (waiting for ASR or the agent) does not
-  interrupt, and is logged once per turn;
+  interrupt (bargein.py logs it once per turn; through udp_listener the
+  server isn't listening then and doesn't feed it to barge-in at all);
 - a longer dip below the threshold starts the count over (one 32 ms dip is
   tolerated), and every turn starts from zero;
 - config overrides (interrupt_min_ms, interrupt_only_while_playing);
@@ -365,16 +366,17 @@ async def udp_test():
         check("udp_listener: no repeat interrupt log once the turn is interrupted",
               LOG.take("VOX  interrupt") == [])
 
-        # VOX, waiting for the agent (nothing playing): 1 s of speech ignored.
+        # VOX, waiting for the agent (nothing playing): the server isn't
+        # listening (2026-10-19, pipeline/attention.py), so 1 s of speech
+        # doesn't even reach barge-in: no interrupt, no barge-in log.
         vox.interrupted.clear()
         b.playing_until = 0.0
         b.new_turn()
         for _ in range(31):
             await send(vox, 0.9)
         lines = LOG.take("VOX")
-        check("udp_listener: 1 s of speech while nothing plays -> no interrupt, logged once",
-              not vox.interrupted.is_set() and len(lines) == 1 and "nothing playing" in lines[0],
-              f"{lines}")
+        check("udp_listener: 1 s of speech while nothing plays -> deaf: no interrupt, no barge-in",
+              not vox.interrupted.is_set() and lines == [], f"{lines}")
 
         # PTT: first frame during a turn interrupts, playback or not, as before.
         ptt = make_dev("onju-ptt", ptt=True)

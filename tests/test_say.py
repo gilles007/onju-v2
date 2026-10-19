@@ -12,11 +12,14 @@ main.py say_server / say_request / play_say):
   wrong token -> 401;
 - happy path through a fake pod (a real TCP listener, real
   pipeline/protocol.py): one audio connection per sentence with mic
-  timeout 0, Opus frames, then 0xDD 0 to close the mic; the requested
+  timeout 0, Opus frames, each followed by 0xDD 0 to keep the mic closed
+  (2026-10-19: firmware before 20261019 opens it for 20 s after every
+  playback, whatever the header says); the requested
   voice goes to the TTS as is (empty = TTS default); 200 with the
   duration; one JSON line in the say log; listen=true keeps the mic open
-  (last header carries the default mic timeout, no 0xDD); wait=false
-  answers "queued" at once; an interrupt stops it (no 0xDD);
+  (last header carries the default mic timeout, no 0xDD after it);
+  wait=false answers "queued" at once; an interrupt stops it (no 0xDD
+  after the interrupted sentence: the user is talking);
 - hermes-voice: no named agents and no tell_agent: a say is never passed
   to the next voice turn (extra_context stays empty);
 - staged announce: optional filler + think_s + delay_s (THINKING held, mic
@@ -331,9 +334,9 @@ async def test_happy():
         check("happy: one audio connection per sentence, mic timeout 0, frames delivered",
               len(audio) == 2 and all(c["mic"] == 0 and c["frames"] == 1 for c in audio),
               f"{env.pod.conns}")
-        check("happy: mic closed at the end (0xDD 0, after the audio)",
-              env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}]
-              and env.pod.conns[-1]["kind"] == "mic_cmd", f"{env.pod.conns}")
+        check("happy: mic kept closed (0xDD 0 after each sentence, last one after the audio)",
+              [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd", "audio", "mic_cmd"]
+              and all(c["mic"] == 0 for c in env.pod.mic_cmds()), f"{env.pod.conns}")
         check("happy: pod released (processing/say_active False)",
               not dev.processing and not dev.say_active)
         lines = env.log_lines()
@@ -369,9 +372,10 @@ async def test_happy():
         st, body = await http(env.port, "POST", "/say",
                               {"text": f"{TAG} one. {TAG} two.", "voice": "pepper", "listen": True})
         await asyncio.sleep(0.2)
-        check("listen: last sentence opens the mic, no 0xDD",
+        check("listen: last sentence opens the mic, no 0xDD after it",
               st == 200 and [c["mic"] for c in env.pod.audio()] == [0, MIC]
-              and not env.pod.mic_cmds(), f"{st} {env.pod.conns}")
+              and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd", "audio"],
+              f"{st} {env.pod.conns}")
 
     # wait=false: answered at once, played in the background.
     async with Env() as env:
@@ -407,9 +411,10 @@ async def test_happy():
         st, body = await http(env.port, "POST", "/say",
                               {"text": f"{TAG} first. {TAG} second.", "voice": "pepper"})
         await asyncio.sleep(0.2)
-        check("interrupt: status interrupted, 1 played, no 0xDD, pod released",
+        check("interrupt: status interrupted, 1 played, no 0xDD after the interrupt, pod released",
               st == 200 and body["status"] == "interrupted" and body["played"] == 1
-              and not env.pod.mic_cmds() and not dev.processing and not dev.say_active,
+              and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd"]
+              and not dev.processing and not dev.say_active,
               f"{st} {body} {env.pod.conns}")
         lines = env.log_lines()
         check("interrupt: logged as interrupted",
@@ -533,8 +538,9 @@ async def test_staged():
                   f"{st} {body}")
             check("staged: two audio connections (filler then answer), mic 0 on both",
                   len(audio) == 2 and all(c["mic"] == 0 for c in audio), f"{env.pod.conns}")
-            check("staged: mic closed only after the answer (one 0xDD)",
-                  env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}], f"{env.pod.conns}")
+            check("staged: mic kept closed after the filler and after the answer",
+                  [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd", "audio", "mic_cmd"],
+                  f"{env.pod.conns}")
             check("staged: TTS got filler then answer in pepper's voice",
                   [s for s, _ in env.tts.calls] == [filler, text]
                   and all(v == "pepper" for _, v in env.tts.calls), f"{env.tts.calls}")
@@ -598,8 +604,8 @@ async def test_staged():
                   st == 200 and body["status"] == "interrupted"
                   and body["played"] == 0 and body["filler_played"] == 1,
                   f"{st} {body}")
-            check("interrupt-in-think: only filler audio, no 0xDD (aborted)",
-                  len(env.pod.audio()) == 1 and not env.pod.mic_cmds(),
+            check("interrupt-in-think: only filler audio and its 0xDD, nothing after the abort",
+                  [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd"],
                   f"{env.pod.conns}")
             check("interrupt-in-think: pod released",
                   not env.devices[0].processing and not env.devices[0].say_active)
@@ -619,8 +625,9 @@ async def test_staged():
         })
         await asyncio.sleep(0.2)
         mics = [c["mic"] for c in env.pod.audio()]
-        check("staged+listen: filler mic 0, answer opens mic, no 0xDD",
-              st == 200 and mics == [0, MIC] and not env.pod.mic_cmds(),
+        check("staged+listen: filler mic 0 (+0xDD), answer opens mic, no 0xDD after it",
+              st == 200 and mics == [0, MIC]
+              and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd", "audio"],
               f"{st} {mics} {env.pod.conns}")
 
 
@@ -676,9 +683,9 @@ async def test_render_whole():
           st == 200 and body["status"] == "played" and body["played"] == 3, f"{st} {body}")
     check("whole: all 3 sentences rendered before the first audio connection",
           kinds(ev) == ["tts"] * 3 + ["open"] * 3, f"{ev}")
-    check("whole: 3 audio connections, mic 0, then 0xDD",
+    check("whole: 3 audio connections, mic 0, each followed by 0xDD 0",
           [c["mic"] for c in env.pod.audio()] == [0, 0, 0]
-          and env.pod.mic_cmds() == [{"kind": "mic_cmd", "mic": 0}], f"{env.pod.conns}")
+          and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd"] * 3, f"{env.pod.conns}")
     check("whole: TTS got each sentence once, in order, in pepper's voice",
           [s for s, _ in env.tts.calls] == [f"{TAG} One.", "Two is here.", "Three!"]
           and all(v == "pepper" for _, v in env.tts.calls), f"{env.tts.calls}")
