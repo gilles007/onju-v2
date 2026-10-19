@@ -12,14 +12,14 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 import numpy as np
 import yaml
 
-from pipeline import bargein
+from pipeline import attention, bargein
 from pipeline import debug_wav
 from pipeline import say as say_mod
 from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, OpusStreamEncoder
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, send_stop_listening, send_mic_holdoff, MIC_HOLDOFF_MAX_MS, send_prebuffer, PREBUFFER_MIN_MS, PREBUFFER_MAX_MS
+from pipeline.protocol import STATE_IDLE, STATE_THINKING, send_audio, send_state, send_led_blink, open_led_connection, write_led_blink, close_led_connection, open_audio_connection, write_audio_frames, close_audio_connection, await_pod_close, send_stop_listening, send_mic_holdoff, MIC_HOLDOFF_MAX_MS, send_prebuffer, PREBUFFER_MIN_MS, PREBUFFER_MAX_MS
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
@@ -61,6 +61,61 @@ def fire_state(ip: str, port: int, state: int) -> asyncio.Task:
     return task
 
 
+# Mic off (0xDD 0, 2026-10-19). The server closes a VOX pod's mic whenever it
+# isn't listening (pipeline/attention.py): at turn start, so the pod doesn't
+# stream while ASR, the stall decision and the agent run, and after every
+# sentence sent with mic timeout 0, because firmware before 20261019 opens
+# the mic for at least MIC_LISTEN_MS (20 s) after any playback, whatever the
+# header says. The mic opens again with the final sentence's header (or the
+# empty send that ends a turn without one). Sent inline (short, bounded) so
+# it reaches the pod in order: behind the sentence it follows and ahead of
+# the next one (the pod takes connections one at a time, in order).
+MIC_OFF_TIMEOUT_S = 0.5
+
+
+async def mic_off(device, port: int, why: str) -> None:
+    try:
+        await asyncio.wait_for(send_stop_listening(device.ip, port, 0), MIC_OFF_TIMEOUT_S)
+        log.debug(f"MIC  off for {device.hostname} ({why})")
+    except Exception as e:
+        log.debug(f"MIC  off for {device.hostname} ({why}) failed: {e!r}")
+
+
+# Pod close confirmation (2026-10-19). After a sentence's end-of-speech marker
+# the server only half-closes the audio connection and waits, in the
+# background, for the pod to close its end, which it does once it has played
+# the sentence. A reset means the pod closed with audio still unread (the
+# tail was lost); no close at all within the expected playback time plus
+# POD_CLOSE_SLACK_S means it never finished. Both are logged as warnings, so
+# a clipped reply shows in the server log instead of looking sent.
+POD_CLOSE_SLACK_S = 15.0
+_confirm_tasks: set[asyncio.Task] = set()
+
+
+def confirm_pod_close(writer, device, sentence: str, n_frames: int, play_left_s: float):
+    timeout = play_left_s + POD_CLOSE_SLACK_S
+
+    async def run():
+        t0 = time.monotonic()
+        result = await await_pod_close(writer, timeout)
+        took = time.monotonic() - t0
+        if result == "reset":
+            log.warning(f"Pod {device.ip} reset the audio connection of {sentence!r} "
+                        f"({n_frames} frames) after {took:.1f}s: its end may not have played")
+        elif result == "timeout":
+            log.warning(f"Pod {device.ip} did not close the audio connection of "
+                        f"{sentence!r} ({n_frames} frames) within {timeout:.1f}s: "
+                        f"it may not have played in full")
+        else:
+            log.debug(f"Pod {device.ip} closed the audio connection of {sentence!r} "
+                      f"after {took:.1f}s")
+
+    task = asyncio.create_task(run())
+    _confirm_tasks.add(task)
+    task.add_done_callback(_confirm_tasks.discard)
+    return task
+
+
 def load_config(path: str = None) -> dict:
     if path is None:
         path = os.path.join(os.path.dirname(__file__), "config.yaml")
@@ -69,7 +124,16 @@ def load_config(path: str = None) -> dict:
 
 
 async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: asyncio.Queue):
-    """Receive u-law audio from ESP32 devices, run VAD or PTT buffering, queue complete utterances."""
+    """Receive u-law audio from ESP32 devices, run VAD or PTT buffering, queue complete utterances.
+
+    VOX attention gating (2026-10-19, pipeline/attention.py): every frame
+    is first checked against attention.listening(). While the server
+    listens, the voice LEDs flash with the user's voice and speech can start
+    a turn (idle) or interrupt one (barge-in). While it doesn't, the frame
+    has no effect at all: no barge-in, no LED, nothing queued; an utterance
+    heard then is only logged as ignored. Speech never carries across a
+    change of attention: the VAD is reset, so a turn can't start from audio
+    that was picked up while the server wasn't listening."""
     udp_port = config["network"]["udp_port"]
     chunk_bytes = config["audio"]["chunk_size"]
     sample_rate = config["audio"]["sample_rate"]
@@ -86,8 +150,18 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
     ptt_timeout = 0.5
     min_utterance_samples = int(sample_rate * 0.3)
     last_packet_time: dict[str, float] = {}
-    was_recording: dict[str, bool] = {}
+    attending: dict[str, bool] = {}   # last attention.listening() result per VOX pod
     max_led_intensity = 150
+
+    def vad_seconds(dev) -> float:
+        return sum(len(b) for b in dev.vad.buffer) / sample_rate if dev.vad.buffer else 0.0
+
+    def ignored(dev, seconds: float, why: str):
+        log.info(f"VAD  ignored utterance from {dev.hostname} ({seconds:.1f}s): {why}")
+
+    async def queue_utterance(dev, audio, how: str):
+        log.info(f"VAD  {how} from {dev.hostname} ({len(audio)/sample_rate:.1f}s)")
+        await utterance_queue.put((dev, audio))
 
     while True:
         # Short timeout to detect PTT release (packet stream stops)
@@ -112,15 +186,18 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
 
                 # VOX device: flush if VAD was recording but packets stopped
                 elif not dev.ptt and dev.vad.recording:
-                    if dev.vad_writer is not None:
-                        await close_led_connection(dev.vad_writer)
-                        dev.vad_writer = None
-                    was_recording[hostname] = False
+                    attention.led_for(dev).close()
                     audio = np.concatenate(dev.vad.buffer) if dev.vad.buffer else None
                     dev.vad.reset()
-                    if audio is not None and len(audio) > min_utterance_samples:
-                        log.info(f"VAD  timeout from {hostname} ({len(audio)/sample_rate:.1f}s)")
-                        await utterance_queue.put((dev, audio))
+                    if audio is None or len(audio) <= min_utterance_samples:
+                        continue
+                    hearing, why = attention.listening(dev, config)
+                    if hearing and (not dev.processing or dev.interrupted.is_set()):
+                        await queue_utterance(dev, audio, "timeout")
+                    else:
+                        ignored(dev, len(audio) / sample_rate,
+                                f"mic stopped; not listening ({why})" if not hearing
+                                else "mic stopped during the reply without interrupting it")
             continue
 
         device = manager.get_by_ip(addr[0])
@@ -143,50 +220,75 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
                 log.info(f"PTT  interrupt from {device.hostname}")
                 device.interrupted.set()
             device.ptt_buffer.append(pcm)
-        else:
-            # VOX: run VAD
-            utterance = device.vad.process_frame(pcm)
+            continue
 
-            # Barge-in (2026-09-26): speech interrupts the turn only once it
-            # has lasted vad.interrupt_min_ms (default 300 ms), and by default
-            # only while the pod is playing the reply, not while we wait for
-            # ASR or the agent. Interrupts and ignored speech are logged.
-            # See pipeline/bargein.py.
-            if device.processing:
-                if not device.interrupted.is_set():
-                    if bargein.for_device(device, config).on_frame(
-                            device.vad.speech_prob, len(pcm) / sample_rate):
-                        device.interrupted.set()
-                continue
+        # ---- VOX ---------------------------------------------------------
+        led = attention.led_for(device)
+        hearing, why = attention.listening(device, config)
+        prev = attending.get(device.hostname)
+        attending[device.hostname] = hearing
+        if prev is not None and hearing != prev:
+            # Attention changed. Speech in progress doesn't carry over: what
+            # was heard while deaf must not start a turn, and speech that was
+            # being listened to stops counting the moment the server stops
+            # listening (the LEDs stop with it).
+            if device.vad.recording:
+                ignored(device, vad_seconds(device),
+                        f"cut off, listening stopped ({why})" if not hearing
+                        else "not listening (started before the server listened)")
+                device.vad.reset()
+            led.close()
 
-            # Track VAD recording transitions for persistent LED TCP
-            prev_recording = was_recording.get(device.hostname, False)
-            curr_recording = device.vad.recording
+        utterance = device.vad.process_frame(pcm)
 
-            if curr_recording and not prev_recording:
-                # VAD just started recording — open persistent TCP for LED blinks
-                device.vad_writer = await open_led_connection(device.ip, tcp_port)
+        if not hearing:
+            # Deaf: no barge-in, no LED, nothing queued. Logged per utterance.
+            if utterance is not None:
+                ignored(device, len(utterance) / sample_rate, f"not listening ({why})")
+            continue
 
-            # LED feedback over persistent connection
-            if device.vad.speech_prob > 0.1:
-                device.led_power = min(max_led_intensity, device.led_power + dev_cfg["led_power"])
+        # Listening: the LEDs flash with the voice (rule 1).
+        if device.vad.speech_prob > 0.1:
+            device.led_power = min(max_led_intensity, device.led_power + dev_cfg["led_power"])
+        if device.processing:
+            # Barge-in listening during a turn: one-shot blinks, so a held
+            # connection can't delay the reply's next audio connection.
+            led.close()
             if now - device.led_update_time > dev_cfg["led_update_period"]:
                 device.led_update_time = now
-                if device.led_power > 0 and device.vad_writer is not None:
-                    if not write_led_blink(device.vad_writer, device.led_power, fade=dev_cfg["led_fade"]):
-                        device.vad_writer = None  # connection lost
+                led.pulse(device.ip, tcp_port, device.led_power, dev_cfg["led_fade"])
                 device.led_power = 0
-
-            was_recording[device.hostname] = curr_recording
-
+            if not device.interrupted.is_set():
+                if bargein.for_device(device, config).on_frame(
+                        device.vad.speech_prob, len(pcm) / sample_rate):
+                    device.interrupted.set()
             if utterance is not None:
-                # Close persistent LED connection before queuing utterance
-                if device.vad_writer is not None:
-                    await close_led_connection(device.vad_writer)
-                    device.vad_writer = None
-                was_recording[device.hostname] = False
-                log.info(f"VAD  utterance from {device.hostname} ({len(utterance)/sample_rate:.1f}s)")
-                await utterance_queue.put((device, utterance))
+                if device.interrupted.is_set():
+                    # The speech that interrupted the turn is the next turn
+                    # (like PTT); the worker takes it once this turn has ended.
+                    await queue_utterance(device, utterance, "utterance (barge-in)")
+                else:
+                    ignored(device, len(utterance) / sample_rate,
+                            "during the reply, did not interrupt it")
+            continue
+
+        # Idle listening: persistent LED connection while the VAD records,
+        # a blink every led_update_period (level 0 = keepalive in pauses).
+        if device.vad.recording:
+            led.ensure(device.ip, tcp_port)
+            # Until the connection is up the level keeps adding up (capped),
+            # so the first blink goes out as soon as it is.
+            if (now - device.led_update_time > dev_cfg["led_update_period"]
+                    and led.alive()):
+                device.led_update_time = now
+                led.blink(device.led_power, dev_cfg["led_fade"])
+                device.led_power = 0
+        if utterance is not None:
+            led.close()
+            await queue_utterance(device, utterance, "utterance")
+        elif not device.vad.recording:
+            device.led_power = 0
+            led.close()
 
 
 def mic_holdoff_ms(config: dict) -> int | None:
@@ -348,13 +450,17 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
                           pcm: list[bytes] | None = None) -> tuple[bool, int]:
     """Synthesize, encode, and stream one sentence over a single
     TCP connection. Opus frames are written as the TTS produces
-    audio; closing the connection signals end-of-segment to the pod.
+    audio; the end-of-speech marker (frame length 0) and closing the
+    connection signal end-of-segment to the pod.
 
     Returns (ok, frames sent). ok is False when the sentence was cut short
     (interrupt, TTS error, pod connection failed): the caller stops there.
     Used by a voice turn (process_utterances, through its send_sentence)
     and by the say endpoint (say_server). mic_timeout: the header's mic
     timeout; None = default_mic_timeout for a final sentence, else 0.
+    When it is 0 on a VOX pod, an explicit mic-off (0xDD 0) follows the
+    sentence (see mic_off()), so the pod's mic stays closed after it
+    plays even on firmware that opens it for 20 s after every playback.
     stall: a stall or filler line; only changes its debug WAV name.
     pcm: audio already rendered for this sentence (say render: whole, see
     _say_render), sent instead of calling the TTS. None = call the TTS."""
@@ -383,13 +489,14 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
     # The pod connection is opened only when the first audio is
     # ready to write (first batch, or the end of the sentence),
     # not before the TTS call (2026-10-01, Ruby). Once the pod
-    # has read the 6-byte header it waits at most 2 s for the
-    # first Opus frame ("Opus task: TCP stalled waiting for frame
-    # length", onjuino.ino), then closes the connection and plays
-    # nothing. Whole-sentence TTS (backend local with Qwen) takes
-    # 2-3 s, so with the connection opened first every sentence
-    # but the shortest was lost, while the server still logged it
-    # as sent. Still one connection per sentence (28134ec).
+    # has read the 6-byte header it gives up on a stream that
+    # sends nothing for TCP_STALL_TIMEOUT_MS ("Opus task: TCP
+    # stalled waiting for frame length", onjuino.ino): 5000 ms
+    # from the last byte received since 6dc6d0f, 2 s before.
+    # Whole-sentence TTS (backend local with Qwen) takes 2-3 s,
+    # so with the connection opened first, sentences were lost
+    # on the 2 s firmware while the server still logged them as
+    # sent. Still one connection per sentence (28134ec).
     writer = None
     seg_start = 0.0
     open_failed = False
@@ -415,8 +522,8 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
         return True
 
     def pod_closed() -> bool:
-        """The pod closed its end (e.g. its 2 s frame timeout):
-        frames written now are lost. Warned once per sentence."""
+        """The pod closed its end (e.g. its 5 s stall timeout, or a
+        tap): frames written now are lost. Warned once per sentence."""
         nonlocal lost_warned
         reader = getattr(writer, "pod_reader", None)
         if lost_warned or reader is None or not reader.at_eof():
@@ -424,7 +531,7 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
         lost_warned = True
         log.warning(f"Pod {device.ip} closed the audio connection after "
                     f"{n_frames} frames; the rest of {sentence!r} is lost "
-                    f"(pod waits at most 2 s for each frame)")
+                    f"(the pod gives up after 5 s without data, or was tapped)")
         return True
 
     audio = (_pcm_chunks(pcm) if pcm is not None else
@@ -485,8 +592,18 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
                 pod_closed()
                 write_audio_frames(writer, tail)
                 n_frames += len(tail)
-            await close_audio_connection(writer)
+            await close_audio_connection(writer, half_close=True)
             barge.audio_sent(seg_start, n_frames * frame_s)
+            # Lost tails show in the log: wait (in the background) for the
+            # pod to close its end once it has played this sentence.
+            confirm_pod_close(writer, device, sentence, n_frames,
+                              max(0.0, barge.playing_until - time.monotonic()))
+            if (mic_timeout == 0 and not device.ptt and not cancelled
+                    and not device.interrupted.is_set()):
+                # Keep the mic closed after this sentence (the next one, or
+                # the end of the turn, decides when it opens). Not after an
+                # interrupt: the user is talking, and the turn reopens it.
+                await mic_off(device, tcp_port, "after sentence")
 
     log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
              f"tts_first[{f'+{t_first:.2f}s' if t_first is not None else 'no audio'}] "
@@ -522,12 +639,31 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
         device.processing = True
         device.interrupted.clear()
         bargein.for_device(device, config).new_turn()
+        # The pod's mic is closed for the turn (below) and must be open again
+        # when it ends: by the final sentence's header, or by reopen_mic().
+        mic_reopened = False
+
+        async def reopen_mic():
+            """Open the VOX pod's mic again (empty audio with the default mic
+            timeout), once per turn. PTT pods: nothing to do."""
+            nonlocal mic_reopened
+            if mic_reopened or device.ptt:
+                return
+            mic_reopened = True
+            try:
+                await send_audio(device.ip, tcp_port, b"",
+                                 mic_timeout=dev_cfg["default_mic_timeout"],
+                                 volume=0, fade=0)
+            except Exception as e:
+                log.debug(f"MIC  reopen for {device.hostname} failed: {e!r}")
 
         try:
-            # Safety: close any lingering LED connection before processing
-            if device.vad_writer is not None:
-                await close_led_connection(device.vad_writer)
-                device.vad_writer = None
+            # The server stops listening here (attention.listening() is False
+            # while processing, except for barge-in): no voice LEDs, and the
+            # pod's mic is closed until the reply's final sentence opens it.
+            attention.led_for(device).close()
+            if not device.ptt:
+                await mic_off(device, tcp_port, "turn start")
 
             # LED THINKING starts here. udp_listener queued this utterance the
             # moment it decided the user stopped talking (VAD end of speech,
@@ -551,10 +687,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
             if not text or (nsp is not None and nsp > no_speech_threshold):
                 log.info(f"ASR  (no speech)")
-                if not device.ptt:
-                    await send_audio(device.ip, tcp_port, b"",
-                                     mic_timeout=dev_cfg["default_mic_timeout"],
-                                     volume=0, fade=0)
+                await reopen_mic()
                 continue
 
             # Check for interrupt before LLM
@@ -563,8 +696,9 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 continue
 
             # Streaming LLM → sentence-buffered TTS → Opus → TCP.
-            # Intermediate sends use mic_timeout=0 so the mic only reopens after
-            # the final chunk has played out.
+            # Intermediate sends use mic_timeout=0, each followed by a mic-off
+            # (stream_sentence), so the mic only reopens after the final chunk
+            # has played out.
             sample_rate = config["audio"]["sample_rate"]
             opus_frame_size = config["audio"]["opus_frame_size"]
 
@@ -580,25 +714,21 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
             async def send_sentence(sentence: str, is_final: bool, stall: bool = False) -> bool:
                 """One sentence of this turn (see stream_sentence)."""
-                nonlocal sent_partial
+                nonlocal sent_partial, mic_reopened
                 ok, _ = await stream_sentence(config, device, sentence, is_final=is_final,
                                               turn_t0=turn_t0, stall=stall)
                 if ok and not is_final:
                     sent_partial = True
+                if ok and is_final:
+                    mic_reopened = True   # its header carries default_mic_timeout
                 return ok
 
 
 
             async def reopen_mic_if_needed():
-                """If we already sent partial audio with mic_timeout=0, the mic
-                is closed — push an empty audio to reopen it on recovery."""
-                if sent_partial and not device.ptt:
-                    try:
-                        await send_audio(device.ip, tcp_port, b"",
-                                         mic_timeout=dev_cfg["default_mic_timeout"],
-                                         volume=0, fade=0)
-                    except Exception:
-                        pass
+                """The turn's mic-off closed the mic (and so did any partial
+                audio): push an empty audio to reopen it on recovery."""
+                await reopen_mic()
 
             # Stall decision (agentic mode only; blocking, capped by config timeout).
             # Passes the previous exchange so the classifier can recognize
@@ -775,15 +905,10 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 # Also the pause-flush case: the last sentence already played
                 # as non-final (mic_timeout=0) during a pause, so close the
                 # turn the same way: an empty send with the default timeout.
-                if not device.ptt:
-                    await send_audio(device.ip, tcp_port, b"",
-                                     mic_timeout=dev_cfg["default_mic_timeout"],
-                                     volume=0, fade=0)
-            elif not device.ptt:
+                await reopen_mic()
+            else:
                 # No content from the LLM and no stall — still reopen the mic.
-                await send_audio(device.ip, tcp_port, b"",
-                                 mic_timeout=dev_cfg["default_mic_timeout"],
-                                 volume=0, fade=0)
+                await reopen_mic()
 
             response_text = " ".join(full_response)
             if response_text:
@@ -798,14 +923,12 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
 
         except Exception as e:
             log.error(f"Pipeline error ({device.hostname}): {e}")
-            if not device.ptt:
-                try:
-                    await send_audio(device.ip, tcp_port, b"",
-                                     mic_timeout=dev_cfg["default_mic_timeout"],
-                                     volume=0, fade=0)
-                except Exception:
-                    pass
+            await reopen_mic()
         finally:
+            # Whatever path the turn took (ASR failure, interrupt, LLM error),
+            # the mic closed at turn start must not stay closed.
+            if not mic_reopened:
+                await reopen_mic()
             device.processing = False
             # LED: every turn ends in IDLE, whatever path it took (answer,
             # no speech, interrupt, LLM failure with no stall, PTT with an
@@ -1045,7 +1168,7 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
     unchanged): delay_s → filler (mic closed) → wait for filler playback →
     STATE_THINKING for think_s → answer. listen applies only to the final
     answer sentence; between parts the mic stays closed (mic_timeout 0,
-    and 0xDD only after the answer when listen is false).
+    and a 0xDD 0 after every sentence sent with it, see stream_sentence).
 
     say render: whole (tts.backend local only, say.render_whole): each part
     is rendered in full before it plays, so its sentences play back to back.
@@ -1117,12 +1240,12 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
                 config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen,
                 rendered=answer_render.result() if answer_render else None)
             frames += n
-        if ok and not listen and not device.ptt and (played or filler_played):
-            # The pod opens its mic for at least 20 s after every playback
-            # (MIC_LISTEN_MS in onjuino.ino), whatever the header says. 0xDD
-            # with 0 s closes it; the pod is still playing, so the command
-            # waits in its TCP backlog and applies right after playback.
-            await send_stop_listening(device.ip, tcp_port, 0)
+        # Mic: every sentence sent with mic timeout 0 (all of them unless
+        # listen) is followed by a 0xDD 0 in stream_sentence: firmware before
+        # 20261019 opens the mic for at least 20 s after every playback
+        # (MIC_LISTEN_MS in onjuino.ino), whatever the header says. The pod
+        # is still playing, so each one waits in its TCP backlog and applies
+        # right after the audio before it.
     finally:
         for task in (filler_render, answer_render):
             if task is not None and not task.done():

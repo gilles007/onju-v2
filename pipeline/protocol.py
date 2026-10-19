@@ -4,6 +4,9 @@ import struct
 
 log = logging.getLogger(__name__)
 
+# Opus frame length 0: end of this audio segment (onjuino.ino opusDecodeTask).
+END_OF_SPEECH = struct.pack('>H', 0)
+
 
 async def send_tcp(ip: str, port: int, header: bytes, data: bytes | None = None, timeout: float = 5):
     try:
@@ -34,12 +37,21 @@ async def send_audio(ip: str, port: int, opus_payload: bytes, mic_timeout: int =
         fade,
         2,  # Opus
     ])
-    await send_tcp(ip, port, header, opus_payload)
+    # (20261019) End with the end-of-speech marker like every streamed
+    # sentence, so the pod can tell a complete stream from a cut one.
+    await send_tcp(ip, port, header, (opus_payload or b"") + END_OF_SPEECH)
 
 
 
 # FIX 20261019
 # Keep connection open until the entire sentence is sent (to prevent chopped audio)
+#
+# Pod side (onjuino.ino opusDecodeTask): each Opus frame is a 2-byte
+# big-endian length plus the frame; a length of 0 is the end-of-speech
+# marker. The pod gives up on a stream that sends nothing for
+# TCP_STALL_TIMEOUT_MS (5000 ms, counted from the last byte received, not
+# from the end of playback). The pod serves one TCP client at a time: a
+# connection opened while it is playing waits in its accept backlog.
 #
 async def open_audio_connection(ip: str, port: int, mic_timeout: int = 60,
                                  volume: int = 14, fade: int = 6,
@@ -51,8 +63,9 @@ async def open_audio_connection(ip: str, port: int, mic_timeout: int = 60,
             asyncio.open_connection(ip, port), timeout=timeout
         )
         # The pod never sends on this connection; its reader only sees EOF
-        # when the pod closes its end (e.g. its 2 s wait for the next Opus
-        # frame ran out). main.py checks pod_reader.at_eof() before writing.
+        # when the pod closes its end (after playback, or when its 5 s
+        # stall timeout fired). main.py checks pod_reader.at_eof() before
+        # writing, and await_pod_close() waits for that EOF.
         writer.pod_reader = reader
         header = bytes([
             0xAA,
@@ -71,7 +84,12 @@ async def open_audio_connection(ip: str, port: int, mic_timeout: int = 60,
 
 def write_audio_frames(writer: asyncio.StreamWriter, opus_frames: list[bytes]) -> bool:
     """Write length-prefixed Opus frames to an open audio connection.
-    Returns False if the connection is dead."""
+    Returns False if the connection is dead. (asyncio's write() doesn't
+    raise on a lost connection, it only logs "socket.send() raised
+    exception." from the 5th write on, so the transport is checked too.)"""
+    transport = getattr(writer, "transport", None)
+    if transport is not None and transport.is_closing():
+        return False
     try:
         for frame in opus_frames:
             writer.write(struct.pack('>H', len(frame)))
@@ -81,14 +99,48 @@ def write_audio_frames(writer: asyncio.StreamWriter, opus_frames: list[bytes]) -
         return False
 
 
-async def close_audio_connection(writer: asyncio.StreamWriter):
-    """Flush and close — EOF tells the pod this audio segment is done."""
+async def close_audio_connection(writer: asyncio.StreamWriter, half_close: bool = False):
+    """End this audio segment: write the end-of-speech marker (frame length
+    0), flush, and close. With half_close the socket is only shut down for
+    writing (the pod still sees EOF) and stays open so the caller can wait
+    for the pod's own close with await_pod_close()."""
     try:
+        writer.write(END_OF_SPEECH)
         await writer.drain()
+        if half_close and writer.can_write_eof():
+            writer.write_eof()
+            return
         writer.close()
         await writer.wait_closed()
     except (ConnectionError, OSError):
         pass
+
+
+async def await_pod_close(writer: asyncio.StreamWriter, timeout: float) -> str:
+    """After close_audio_connection(half_close=True): wait up to `timeout`
+    s for the pod to close its end, then close ours. Returns "closed" (the
+    pod read everything and closed normally), "reset" (the pod reset the
+    connection, e.g. it closed with audio still unread: the tail was lost)
+    or "timeout"."""
+    reader = getattr(writer, "pod_reader", None)
+    result = "closed"
+    try:
+        if reader is not None:
+            async def _until_eof():
+                while await reader.read(4096):
+                    pass   # the pod never sends; ignore anything
+            await asyncio.wait_for(_until_eof(), timeout)
+    except asyncio.TimeoutError:
+        result = "timeout"
+    except (ConnectionError, OSError):
+        result = "reset"
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+    return result
 #
 # End of Fix 20261019
 
@@ -177,11 +229,14 @@ async def send_stop_listening(ip: str, port: int, hold_s: int = 0):
 
 
 async def open_led_connection(ip: str, port: int, timeout: float = 1) -> asyncio.StreamWriter | None:
-    """Open a persistent TCP connection for streaming LED blink commands."""
+    """Open a persistent TCP connection for streaming LED blink commands.
+    The reader is kept as writer.pod_reader: it sees EOF once the pod has
+    closed the connection (it does after 500 ms without a command)."""
     try:
-        _, writer = await asyncio.wait_for(
+        reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port), timeout=timeout
         )
+        writer.pod_reader = reader
         return writer
     except (asyncio.TimeoutError, ConnectionError, OSError):
         return None
@@ -189,8 +244,13 @@ async def open_led_connection(ip: str, port: int, timeout: float = 1) -> asyncio
 
 def write_led_blink(writer: asyncio.StreamWriter, intensity: int,
                     r: int = 255, g: int = 255, b: int = 255, fade: int = 6) -> bool:
-    """Write a LED blink command to an open connection. Non-async (6-byte buffer write)."""
+    """Write a LED blink command to an open connection. Non-async (6-byte
+    buffer write). intensity 0 is a keepalive the pod ignores. Returns False
+    if the connection is already known to be dead."""
     header = bytes([0xCC, intensity, r, g, b, fade])
+    transport = getattr(writer, "transport", None)
+    if transport is not None and transport.is_closing():
+        return False
     try:
         writer.write(header)
         return True
