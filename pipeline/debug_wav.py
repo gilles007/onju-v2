@@ -66,6 +66,11 @@ def _clean(text: str, chars: int) -> str:
     return re.sub(r"_+", "_", out).strip("_.,-")
 
 
+def save_enabled(config: dict) -> bool:
+    """debug.save_wavs (default true): false = write no debug WAVs at all."""
+    return bool((config.get("debug") or {}).get("save_wavs", True))
+
+
 def wav_name(sentence: str, when: datetime.datetime, *, voice: str = "",
              stall: bool = False) -> str:
     """YYYYMMDD-HHMMSS_<voice>_<preview>.wav, or ..._<voice>__<preview>.wav

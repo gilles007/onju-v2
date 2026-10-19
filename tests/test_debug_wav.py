@@ -90,6 +90,9 @@ def main():
         now = dw.local_now({})
         check("default zone is America/Los_Angeles", str(now.tzinfo) == "America/Los_Angeles",
               now.tzinfo)
+        check("debug.save_wavs: default true, false turns saving off",
+              dw.save_enabled({}) and dw.save_enabled({"debug": {"tz": "UTC"}})
+              and not dw.save_enabled({"debug": {"save_wavs": False}}))
         now = dw.local_now({"debug": {"tz": "Europe/Paris"}})
         check("debug.tz from the config", str(now.tzinfo) == "Europe/Paris", now.tzinfo)
         dw._warned = False

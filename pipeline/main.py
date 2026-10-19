@@ -704,9 +704,12 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
              f"to {device.ip} "
              f"({'final' if is_final else 'partial'}: {sentence!r})")
 
-    # Debug dump (not for a say "wav": that audio is the caller's own file)
+    # Debug dump (not for a say "wav": that audio is the caller's own file;
+    # none at all with debug.save_wavs: false)
     if not save_debug:
         log.info(f"DEBUG  not saved (say wav input)")
+        return True, n_frames
+    if not debug_wav.save_enabled(config):
         return True, n_frames
     import pathlib, wave as _wave
     _dbg_dir = pathlib.Path("/tmp/tts-debug")

@@ -863,6 +863,14 @@ async def test_wav():
         check("wav without text: labelled [wav 1.0s] in say.log",
               any(x["text"] == "[wav 1.0s]" for x in lines), f"{lines}")
 
+    # debug.save_wavs: false -> a TTS say writes no debug WAV either.
+    async with Env() as env:
+        env.config["debug"] = {"save_wavs": False}
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} not kept."})
+        check("debug.save_wavs false: TTS say played, no debug WAV written",
+              st == 200 and body["status"] == "played"
+              and not glob.glob(f"/tmp/tts-debug/*{TAG}_not_kept*.wav"), f"{st} {body}")
+
     async with Env() as env:
         bad = [({"wav": "not base64!"}, "base64"),
                ({"wav": "aGVsbG8="}, "not a PCM WAV"),
