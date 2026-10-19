@@ -4,10 +4,19 @@ Attention gating and the voice LEDs (2026-10-19, Ruby).
 One rule, per pod:
 
 1. While the server is listening to the mic (anything it hears can start a
-   turn or interrupt one), the pod's LEDs flash with the user's voice.
+   turn, add to one or interrupt one), the pod's LEDs flash with the
+   user's voice.
 2. While it is not listening, what the mic picks up has no effect at all:
    no turn, no barge-in, no LED blinks. The server also closes the pod's
    mic for that time (0xDD 0, see main.py), so normally nothing streams.
+
+When it listens during a turn (2026-10-19, "keep adding while it's
+thinking"): from the moment an utterance is handed to ASR / the agent until
+the first audio of that turn (stall line or answer) starts playing, the
+server keeps listening (device.thinking). Speech in that window cancels the
+pending request and is merged into it as one new turn (see main.py
+process_utterances). From playback start until the final sentence reopens
+the mic the server is deaf, except while barge-in is armed.
 
 listening() is the one place that decides which of the two applies.
 LedLink keeps the LED connection that carries the voice blinks.
@@ -30,6 +39,12 @@ def listening(device, config: dict, now: float | None = None) -> tuple[bool, str
 
     Returns (listening, why):
       (True, "idle")         no turn and no say: speech starts a turn.
+      (True, "thinking")     a voice turn is waiting for ASR / the stall
+                             decision / the agent and none of its audio
+                             has started playing: speech is an add-on that
+                             cancels the pending request and is merged into
+                             it (device.thinking, set by process_utterances,
+                             cleared by stream_sentence at playback start).
       (True, "barge-in")     a turn or say is running and barge-in is armed
                              (by default: the reply is estimated to be
                              playing, see pipeline/bargein.py), so speech
@@ -44,6 +59,8 @@ def listening(device, config: dict, now: float | None = None) -> tuple[bool, str
         return True, "idle"
     if device.interrupted.is_set():
         return True, "interrupted"
+    if getattr(device, "thinking", False):
+        return True, "thinking"
     if bargein.for_device(device, config).armed(now):
         return True, "barge-in"
     return False, ("say in progress" if getattr(device, "say_active", False)
@@ -53,7 +70,8 @@ def listening(device, config: dict, now: float | None = None) -> tuple[bool, str
 class LedLink:
     """The voice-blink connection to one pod.
 
-    While idle-listening and the VAD is recording, udp_listener keeps one
+    While idle- or thinking-listening and the VAD is recording (and for an
+    add-on until it ends), udp_listener keeps one
     persistent TCP connection open and writes a 0xCC blink every
     led_update_period: the voice level, or level 0 as a keepalive when the
     user pauses (the pod drops a connection that sends nothing for 500 ms,

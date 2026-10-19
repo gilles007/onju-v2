@@ -62,9 +62,10 @@ def fire_state(ip: str, port: int, state: int) -> asyncio.Task:
 
 
 # Mic off (0xDD 0, 2026-10-19). The server closes a VOX pod's mic whenever it
-# isn't listening (pipeline/attention.py): at turn start, so the pod doesn't
-# stream while ASR, the stall decision and the agent run, and after every
-# sentence sent with mic timeout 0, because firmware before 20261019 opens
+# isn't listening (pipeline/attention.py): when the turn's first audio (stall
+# line or answer) starts playing (stream_sentence; until then the server
+# listens for an add-on and the mic is held open, see THINKING_MIC_S), and
+# after every sentence sent with mic timeout 0, because firmware before 20261019 opens
 # the mic for at least MIC_LISTEN_MS (20 s) after any playback, whatever the
 # header says. The mic opens again with the final sentence's header (or the
 # empty send that ends a turn without one). Sent inline (short, bounded) so
@@ -72,13 +73,56 @@ def fire_state(ip: str, port: int, state: int) -> asyncio.Task:
 # the next one (the pod takes connections one at a time, in order).
 MIC_OFF_TIMEOUT_S = 0.5
 
+# Mic held open while a turn thinks (0xDD THINKING_MIC_S at turn start), so
+# the user can add to the request until the reply starts playing. Without it
+# the pod would close the mic about 5 s after the last voice blink
+# (VAD_MIC_EXTEND in onjuino.ino) and an add-on later in a long agent wait
+# could not be heard. 0xDD sets the timeout exactly, also on old firmware.
+# Playback start closes it again (mic_off), so this is only an upper bound.
+THINKING_MIC_S = 60
 
-async def mic_off(device, port: int, why: str) -> None:
+# Silence inserted between a cancelled request's audio and its add-on when
+# both are transcribed together (the add-on came before ASR had finished).
+ADDON_GAP_S = 0.3
+
+
+async def mic_off(device, port: int, why: str, hold_s: int = 0) -> None:
+    """0xDD hold_s: 0 closes the pod's mic, N holds it open N s from now."""
+    what = "off" if hold_s == 0 else f"open {hold_s}s"
     try:
-        await asyncio.wait_for(send_stop_listening(device.ip, port, 0), MIC_OFF_TIMEOUT_S)
-        log.debug(f"MIC  off for {device.hostname} ({why})")
+        await asyncio.wait_for(send_stop_listening(device.ip, port, hold_s), MIC_OFF_TIMEOUT_S)
+        log.debug(f"MIC  {what} for {device.hostname} ({why})")
     except Exception as e:
-        log.debug(f"MIC  off for {device.hostname} ({why}) failed: {e!r}")
+        log.debug(f"MIC  {what} for {device.hostname} ({why}) failed: {e!r}")
+
+
+async def unless_interrupted(device, aw):
+    """Await aw, but give up as soon as device.interrupted is set (barge-in,
+    PTT press, or an add-on while thinking): aw is cancelled then. Returns
+    (True, result), or (False, None) when interrupted. aw's exceptions
+    propagate. Lets a turn drop a slow ASR / stall / agent wait at once."""
+    if device.interrupted.is_set():
+        if asyncio.iscoroutine(aw):
+            aw.close()
+        elif isinstance(aw, asyncio.Future):
+            aw.cancel()
+        return False, None
+    task = asyncio.ensure_future(aw)
+    stop = asyncio.ensure_future(device.interrupted.wait())
+    try:
+        await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stop.cancel()
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            return False, None
+    if device.interrupted.is_set():
+        return False, None
+    return True, task.result()
 
 
 # Pod close confirmation (2026-10-19). After a sentence's end-of-speech marker
@@ -131,7 +175,14 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
     listens, the voice LEDs flash with the user's voice and speech can start
     a turn (idle) or interrupt one (barge-in). While it doesn't, the frame
     has no effect at all: no barge-in, no LED, nothing queued; an utterance
-    heard then is only logged as ignored. Speech never carries across a
+    heard then is only logged as ignored.
+
+    Add-on (2026-10-19): while a turn is still thinking (listening() says
+    "thinking": nothing of it has played yet), speech that starts cancels
+    the pending turn at once (device.addon + interrupted) and, when it ends,
+    is queued as an add-on; process_utterances merges it with the cancelled
+    request into one turn. It keeps the persistent LED connection, like idle
+    speech. Speech never carries across a
     change of attention: the VAD is reset, so a turn can't start from audio
     that was picked up while the server wasn't listening."""
     udp_port = config["network"]["udp_port"]
@@ -189,10 +240,20 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
                     attention.led_for(dev).close()
                     audio = np.concatenate(dev.vad.buffer) if dev.vad.buffer else None
                     dev.vad.reset()
-                    if audio is None or len(audio) <= min_utterance_samples:
+                    addon = getattr(dev, "addon", False) or carry_pending(dev)
+                    if audio is None or (len(audio) <= min_utterance_samples and not addon):
+                        if addon:
+                            # Nothing usable heard, but the cancelled request
+                            # must still go out: an empty add-on resends it.
+                            await queue_utterance(dev, np.zeros(0, dtype=np.int16),
+                                                  "timeout (empty add-on)")
                         continue
                     hearing, why = attention.listening(dev, config)
-                    if hearing and (not dev.processing or dev.interrupted.is_set()):
+                    if addon:
+                        # An add-on cancelled the turn: always hand it over
+                        # (even if short), so the cancelled request is resent.
+                        await queue_utterance(dev, audio, "timeout (add-on)")
+                    elif hearing and (not dev.processing or dev.interrupted.is_set()):
                         await queue_utterance(dev, audio, "timeout")
                     else:
                         ignored(dev, len(audio) / sample_rate,
@@ -250,7 +311,18 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
         # Listening: the LEDs flash with the voice (rule 1).
         if device.vad.speech_prob > 0.1:
             device.led_power = min(max_led_intensity, device.led_power + dev_cfg["led_power"])
-        if device.processing:
+        if (why == "thinking" and device.vad.recording
+                and not device.interrupted.is_set()):
+            # Add-on: the user speaks again before any of the reply has
+            # played. Cancel the pending turn now (its stall line and answer
+            # must not start while he is still talking); process_utterances
+            # carries its words into the next turn, merged with this speech.
+            device.addon = True
+            device.interrupted.set()
+            log.info(f"VAD  add-on from {device.hostname}: cancelling the pending "
+                     f"request, it will be resent with what follows")
+        if why == "barge-in" or (why == "interrupted" and not (
+                getattr(device, "addon", False) or carry_pending(device))):
             # Barge-in listening during a turn: one-shot blinks, so a held
             # connection can't delay the reply's next audio connection.
             led.close()
@@ -272,8 +344,11 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
                             "during the reply, did not interrupt it")
             continue
 
-        # Idle listening: persistent LED connection while the VAD records,
-        # a blink every led_update_period (level 0 = keepalive in pauses).
+        # Idle, thinking or add-on listening: persistent LED connection while
+        # the VAD records, a blink every led_update_period (level 0 =
+        # keepalive in pauses). Nothing of the turn is playing, so the held
+        # connection delays no audio; stream_sentence closes it before the
+        # first audio of a turn anyway.
         if device.vad.recording:
             led.ensure(device.ip, tcp_port)
             # Until the connection is up the level keeps adding up (capped),
@@ -285,10 +360,18 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
                 device.led_power = 0
         if utterance is not None:
             led.close()
-            await queue_utterance(device, utterance, "utterance")
+            addon = getattr(device, "addon", False) or carry_pending(device)
+            await queue_utterance(device, utterance,
+                                  "utterance (add-on)" if addon else "utterance")
         elif not device.vad.recording:
             device.led_power = 0
             led.close()
+
+
+def carry_pending(device) -> bool:
+    """A cancelled request is waiting to be merged into the next turn."""
+    return (getattr(device, "carry_text", None) is not None
+            or getattr(device, "carry_audio", None) is not None)
 
 
 def mic_holdoff_ms(config: dict) -> int | None:
@@ -505,6 +588,15 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
 
     async def open_pod() -> bool:
         nonlocal writer, seg_start, open_failed
+        if getattr(device, "thinking", False):
+            # The turn's first audio is about to play: the server stops
+            # listening (attention.listening(): no more add-ons, LEDs stop)
+            # and closes the pod's mic until the final sentence reopens it.
+            # Set before any await, so no add-on can slip in after it.
+            device.thinking = False
+            attention.led_for(device).close()
+            if not device.ptt:
+                await mic_off(device, tcp_port, "playback start")
         writer = await open_audio_connection(
             device.ip, tcp_port,
             mic_timeout=mic_timeout,
@@ -628,7 +720,20 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
 
 
 async def process_utterances(config: dict, manager: DeviceManager, utterance_queue: asyncio.Queue):
-    """Process complete utterances: ASR -> Conversation -> TTS -> Opus -> TCP."""
+    """Process complete utterances: ASR -> Conversation -> TTS -> Opus -> TCP.
+
+    Add-on while thinking (2026-10-19): a VOX turn keeps the server listening
+    (device.thinking) until its first audio starts playing. If the user
+    speaks again before that, udp_listener sets device.addon and interrupts
+    the turn: it stops at once (ASR, stall decision and agent waits are all
+    raced against the interrupt), its stall line is skipped if it hasn't
+    started, its agent stream is cancelled, and its words are carried over
+    (device.carry_text, or device.carry_audio if ASR hadn't finished). The
+    next utterance (the add-on) is merged with them into one request.
+    Note: if the cancelled request already reached an agent (relay/webhook,
+    grok bridge), that agent may have started working on it; its answer is
+    discarded (the stream is closed and turn_seq guards every sentence), and
+    nothing of it is committed to the conversation."""
     tcp_port = config["network"]["tcp_port"]
     dev_cfg = config["device"]
     no_speech_threshold = 0.45
@@ -642,15 +747,33 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
         device.processing = True
         device.interrupted.clear()
         bargein.for_device(device, config).new_turn()
-        # The pod's mic is closed for the turn (below) and must be open again
-        # when it ends: by the final sentence's header, or by reopen_mic().
+        device.turn_seq = getattr(device, "turn_seq", 0) + 1
+        my_seq = device.turn_seq
+        # Add-on: words of the request this utterance cancelled.
+        carry_text = getattr(device, "carry_text", None)
+        carry_audio = getattr(device, "carry_audio", None)
+        device.carry_text = device.carry_audio = None
+        device.addon = False
+        if carry_audio is not None:
+            if isinstance(audio_int16, np.ndarray) and isinstance(carry_audio, np.ndarray):
+                gap = np.zeros(int(config["audio"]["sample_rate"] * ADDON_GAP_S), dtype=np.int16)
+                audio_int16 = np.concatenate([carry_audio.astype(np.int16), gap,
+                                              audio_int16.astype(np.int16)])
+            else:
+                audio_int16 = carry_audio
+        heard_text: str | None = None      # this turn's words (merged), as transcribed
+        prev_user_text = device.last_user_text
+        # The final sentence's header (or reopen_mic()) leaves the pod's mic
+        # open at the end of the turn; it is closed from playback start.
         mic_reopened = False
 
         async def reopen_mic():
             """Open the VOX pod's mic again (empty audio with the default mic
             timeout), once per turn. PTT pods: nothing to do."""
             nonlocal mic_reopened
-            if mic_reopened or device.ptt:
+            if mic_reopened or device.ptt or getattr(device, "addon", False):
+                # Add-on: the user is talking into an open mic; an audio
+                # header now would stop it (playback + holdoff).
                 return
             mic_reopened = True
             try:
@@ -661,12 +784,15 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 log.debug(f"MIC  reopen for {device.hostname} failed: {e!r}")
 
         try:
-            # The server stops listening here (attention.listening() is False
-            # while processing, except for barge-in): no voice LEDs, and the
-            # pod's mic is closed until the reply's final sentence opens it.
+            # Thinking: the server keeps listening (attention.listening()
+            # "thinking") until the first audio of this turn starts playing
+            # (stream_sentence closes the mic then); speech meanwhile is an
+            # add-on. The pod's mic is held open for that window.
             attention.led_for(device).close()
             if not device.ptt:
-                await mic_off(device, tcp_port, "turn start")
+                device.thinking = True
+                await mic_off(device, tcp_port, "thinking, listening for an add-on",
+                              hold_s=THINKING_MIC_S)
 
             # LED THINKING starts here. udp_listener queued this utterance the
             # moment it decided the user stopped talking (VAD end of speech,
@@ -679,19 +805,36 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             fire_state(device.ip, tcp_port, STATE_THINKING)
 
             # ASR
-            pcm_bytes = audio_int16.astype(np.int16).tobytes()
-            try:
-                asr_result = await asr.transcribe(pcm_bytes, config)
-            except Exception as e:
-                log.error(f"ASR  failed ({config['asr']['url']}): {e}")
-                continue
-            text = asr_result.get("text", "").strip()
-            nsp = asr_result.get("no_speech_prob")
-
+            if carry_text is not None:
+                log.info(f"ADDON resending the cancelled request with the add-on: {carry_text!r} + ...")
+            text = ""
+            nsp = None
+            if audio_int16 is not None and getattr(audio_int16, "size", 1) > 0:
+                pcm_bytes = audio_int16.astype(np.int16).tobytes()
+                try:
+                    done, asr_result = await unless_interrupted(
+                        device, asr.transcribe(pcm_bytes, config))
+                except Exception as e:
+                    log.error(f"ASR  failed ({config['asr']['url']}): {e}")
+                    if carry_text is None:
+                        continue
+                    done, asr_result = True, {}
+                if not done:
+                    log.info(f"Interrupted during ASR")
+                    continue
+                text = asr_result.get("text", "").strip()
+                nsp = asr_result.get("no_speech_prob")
             if not text or (nsp is not None and nsp > no_speech_threshold):
-                log.info(f"ASR  (no speech)")
-                await reopen_mic()
-                continue
+                text = ""
+                if carry_text is None:
+                    log.info(f"ASR  (no speech)")
+                    await reopen_mic()
+                    continue
+                log.info(f"ASR  (no speech in the add-on)")
+            if carry_text is not None:
+                text = f"{carry_text} {text}".strip()
+                log.info(f"ADDON merged request: {text!r}")
+            heard_text = text
 
             # Check for interrupt before LLM
             if device.interrupted.is_set():
@@ -752,6 +895,10 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             async def send_sentence(sentence: str, is_final: bool, stall: bool = False) -> bool:
                 """One sentence of this turn (see stream_sentence)."""
                 nonlocal sent_partial, mic_reopened
+                if device.turn_seq != my_seq:
+                    # Never play an answer to a request that was superseded.
+                    log.info(f"ADDON discarding {sentence!r}: its request was superseded")
+                    return False
                 ok, _ = await stream_sentence(config, device, sentence, is_final=is_final,
                                               turn_t0=turn_t0, tts_kwargs=tts_kwargs,
                                               stall=stall)
@@ -774,12 +921,15 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             # conversational rather than tool-needing.
             stall_text: str | None = None
             if config["conversation"].get("backend") == "agentic":
-                stall_text = await stall_mod.decide_stall(
+                done, stall_text = await unless_interrupted(device, stall_mod.decide_stall(
                     text,
                     config,
                     prev_user=device.last_user_text,
                     prev_assistant=device.last_response,
-                )
+                ))
+                if not done:
+                    log.info(f"Interrupted during the stall decision")
+                    continue
                 stall_decided_at = time.monotonic() - turn_t0
                 if stall_text:
                     log.info(f"STALL [+{stall_decided_at:.2f}s] decided: {stall_text!r}")
@@ -838,6 +988,10 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         device.conversation.stream(text, extra_context=extra_context,
                                                    **conv_kwargs)
                     ):
+                        if device.turn_seq != my_seq:
+                            log.info(f"ADDON discarding the late answer to a superseded "
+                                     f"request: {s!r}")
+                            return
                         await sentence_q.put(s)
                 except asyncio.CancelledError:
                     raise
@@ -856,7 +1010,8 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 while True:
                     if pending is not None and pause_flush_s > 0:
                         try:
-                            item = await asyncio.wait_for(sentence_q.get(), pause_flush_s)
+                            done, item = await unless_interrupted(
+                                device, asyncio.wait_for(sentence_q.get(), pause_flush_s))
                         except asyncio.TimeoutError:
                             # The text stream paused with a sentence held: play
                             # it now as non-final (mic stays closed, the turn
@@ -875,7 +1030,13 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                             fire_state(device.ip, tcp_port, STATE_THINKING)
                             continue
                     else:
-                        item = await sentence_q.get()
+                        done, item = await unless_interrupted(device, sentence_q.get())
+                    if not done:
+                        # Interrupted (barge-in, or an add-on: stop waiting
+                        # for the agent; its answer is never played).
+                        log.info(f"Interrupted while waiting for the agent")
+                        aborted = True
+                        break
                     if item is _STREAM_END:
                         break
                     if isinstance(item, BaseException):
@@ -968,10 +1129,25 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             log.error(f"Pipeline error ({device.hostname}): {e}")
             await reopen_mic()
         finally:
+            device.thinking = False
+            if getattr(device, "addon", False):
+                # Superseded by an add-on: carry its words into the next turn
+                # (the add-on), nothing of it is committed or remembered.
+                if heard_text is not None:
+                    device.carry_text = heard_text
+                else:
+                    device.carry_audio = audio_int16
+                device.last_user_text = prev_user_text
+                device.turn_seq += 1     # a late answer to it can't match any turn
+                carried = (repr(heard_text) if heard_text is not None
+                           else "(audio, not transcribed yet)")
+                log.info(f"ADDON request cancelled before any reply played; "
+                         f"carried into the next turn: {carried}")
             # Whatever path the turn took (ASR failure, interrupt, LLM error),
-            # the mic closed at turn start must not stay closed.
+            # the mic closed at playback start must not stay closed.
             if not mic_reopened:
                 await reopen_mic()
+            device.addon = False
             device.processing = False
             if route is not None:
                 router.touch(device.hostname)   # sticky clock runs from the turn's end
