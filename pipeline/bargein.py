@@ -31,9 +31,14 @@ playing (isPlaying), so during playback itself no frames arrive, and its
 own speaker can't trigger an interrupt. Speech reaches the server while
 the reply counts as playing when a tap has stopped the pod's playback
 early (the server isn't told, so the rest of the reply still counts as
-playing), or around the end of a playback, within the margin below. The
-frames that dropped replies before came in while the server was waiting
-for the agent: after the stall line has played, the pod's mic is open.
+playing), or around the end of a playback, within the margin below.
+
+Attention gating (2026-10-19, pipeline/attention.py): main.py only feeds
+frames to on_frame() while barge-in is armed (armed() below), and the voice
+LEDs flash for exactly those frames. Outside that window a turn is deaf:
+its frames have no effect at all, and the server closes the pod's mic
+(0xDD 0) at turn start and after every sentence that isn't the last, so
+the open mic after the stall line that used to drop replies is gone.
 
 The state lives in one BargeIn object per pod, kept in a small registry
 keyed by hostname (for_device()), like main.py keeps per-pod state for the
@@ -122,6 +127,13 @@ class BargeIn:
     def is_playing(self, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else now
         return now < self.playing_until
+
+    def armed(self, now: float | None = None) -> bool:
+        """Can speech interrupt the running turn right now? Always with
+        interrupt_only_while_playing off, else only while the reply is
+        estimated to be playing. main.py listens (and flashes the voice
+        LEDs) during a turn only while this is True."""
+        return (not self.only_while_playing) or self.is_playing(now)
 
     # ---- decision ---------------------------------------------------------
 

@@ -111,7 +111,7 @@ class ConnRecorder(ls.StateRecorder):
         self.mark("write", len(frames))
         return True
 
-    async def close(self, writer):
+    async def close(self, writer, half_close=False):
         self.mark("close")
 
 

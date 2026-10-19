@@ -160,6 +160,10 @@ vad:
   # interrupt on a button press, these don't apply to them.
   interrupt_min_ms: 300                      # continuous speech needed to interrupt (0 = first frame over threshold)
   interrupt_only_while_playing: true         # only while the pod plays the reply, not while waiting for ASR / the agent
+  # Attention (pipeline/attention.py): the voice LEDs flash exactly while the
+  # server listens to the mic. During a turn it listens only while barge-in
+  # is armed (per the two settings above); otherwise speech has no effect at
+  # all and the pod's mic is closed (0xDD 0) until the final sentence.
 
 network:
   udp_port: 3000
@@ -195,6 +199,12 @@ audio:
 
 device:
   default_volume: 15
+  # default_mic_timeout: how long (s) the pod keeps its mic open after the
+  # reply's last sentence. The pod opens it for at least 20 s after any
+  # playback with a nonzero mic timeout (MIC_LISTEN_MS in onjuino.ino), so
+  # values under 20 act as 20. Only 0 ("keep it closed", sent for every
+  # sentence but the last) is honored exactly, from firmware 20261019 on;
+  # the server also sends 0xDD 0 after those sentences for older firmware.
   default_mic_timeout: 60
   led_fade: 2
   led_power: 50

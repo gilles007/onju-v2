@@ -981,10 +981,25 @@ void loop()
                 // 20260819 LED Animation - Update state
                 visualState = VS_IDLE;
 
-                if (!PTT_MODE && deviceEnabled) {
-                    uint32_t timeout_ms = max((uint32_t)(timeout * 1000), (uint32_t)MIC_LISTEN_MS);
-                    mic_timeout = millis() + timeout_ms;
-                    Serial.println("Set mic_timeout to " + String(mic_timeout) + " (" + String(timeout_ms/1000) + "s)");
+                // (20261019) A header mic timeout of 0 means "keep the mic closed
+                // after this audio" (the server sends it for every sentence but
+                // the last, and opens the mic with the last one). It used to get
+                // the MIC_LISTEN_MS floor too, so the mic opened for 20 s after
+                // every sentence while the server wasn't listening. A nonzero
+                // timeout keeps the floor. After a tap interrupt the tap has
+                // already opened the mic (handleShortPress): leave it open.
+                if (!PTT_MODE && deviceEnabled && !wasInterrupted) {
+                    if (timeout == 0)
+                    {
+                        mic_timeout = 0;
+                        Serial.println("Mic stays closed (header mic timeout 0)");
+                    }
+                    else
+                    {
+                        uint32_t timeout_ms = max((uint32_t)(timeout * 1000), (uint32_t)MIC_LISTEN_MS);
+                        mic_timeout = millis() + timeout_ms;
+                        Serial.println("Set mic_timeout to " + String(mic_timeout) + " (" + String(timeout_ms/1000) + "s)");
+                    }
                 }
                 Serial.println("Done loading audio in buffers in " + String(millis() - tic) + "ms");
             }
@@ -1160,6 +1175,8 @@ void opusDecodeTask(void *pvParameters)
 
     bool initialBufferFilled = false;
     size_t totalSamplesRead = 0;
+    bool gotEndMarker = false;        // (20261019) stream ended with frame_len == 0
+    uint32_t samplesDecoded = 0;      // (20261019) whole stream, for the log below
 
     while (client->connected() || client->available())
     {
@@ -1204,6 +1221,7 @@ void opusDecodeTask(void *pvParameters)
         if (frame_len == 0)
         {
             Serial.println("End of speech marker received");
+            gotEndMarker = true;
             break;
         }
         if (frame_len > OPUS_MAX_PACKET)
@@ -1255,6 +1273,7 @@ void opusDecodeTask(void *pvParameters)
         {
             wavData[totalSamplesRead++] = (int32_t)opus_pcm_buffer[i] << speaker_volume;
         }
+        samplesDecoded += num_samples;
 
         // Start draining once we have reservoir
         if (initialBufferFilled || totalSamplesRead >= bufferThreshold)
@@ -1268,6 +1287,15 @@ void opusDecodeTask(void *pvParameters)
             playAndMeter(wavData, totalSamplesRead);
             totalSamplesRead = 0;
         }
+    }
+
+    if (!interruptPlayback && !gotEndMarker)
+    {
+        // (20261019) The server ends every sentence with the end-of-speech
+        // marker. A stream that ends without it was cut (connection reset,
+        // closed early, or the stall timeout): what is played below is
+        // only the part that arrived.
+        Serial.printf("Stream ended without end marker after %u samples\n", (unsigned)samplesDecoded);
     }
 
     if (interruptPlayback)
