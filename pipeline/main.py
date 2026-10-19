@@ -1334,11 +1334,17 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
                    filler_sentences: list[str] | None = None,
                    filler_text: str | None = None,
                    think_s: float = 0.0, delay_s: float = 0.0,
-                   barge=None, utterance_queue: asyncio.Queue | None = None) -> dict:
+                   barge=None, utterance_queue: asyncio.Queue | None = None,
+                   answer_pcm: list[bytes] | None = None, tell: bool = True) -> dict:
     """Play a say on a pod already claimed by say_request (say_active and
     processing set). Same path as a voice turn: stream_sentence() per
     sentence, so the speaking LEDs, barge-in estimate, SEND lines and debug
     WAVs all apply.
+
+    answer_pcm (say "wav"): the answer's audio, already 16 kHz mono PCM
+    chunks; sentences is then its one label and the TTS is not called for
+    it. tell: False when there is no real text to pass to the agent (a wav
+    without "text"; only used where says are told to the agent).
 
     Optional staging (all no-ops when unset, so plain announces are
     unchanged): delay_s → filler (mic closed) → wait for filler playback →
@@ -1370,8 +1376,9 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
         if filler_sentences:
             filler_render = asyncio.create_task(
                 _say_render(config, device, filler_sentences, tts_kwargs))
-        answer_render = asyncio.create_task(
-            _say_render(config, device, sentences, tts_kwargs, after=filler_render))
+        if answer_pcm is None:
+            answer_render = asyncio.create_task(
+                _say_render(config, device, sentences, tts_kwargs, after=filler_render))
     log.info(f"SAY   {device.hostname} voice={tts_voice or 'tts default'} bot={bot or '-'} "
              f"{len(sentences)} sentence(s)"
              f"{f', filler={filler_text!r}' if filler_text else ''}"
@@ -1414,7 +1421,8 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
             # Final part of a multi-stage say, or the only part of a plain one.
             ok, n, played = await _say_stream_part(
                 config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen,
-                rendered=answer_render.result() if answer_render else None)
+                rendered=([answer_pcm] if answer_pcm is not None
+                          else answer_render.result() if answer_render else None))
             frames += n
         # Mic: every sentence sent with mic timeout 0 (all of them unless
         # listen) is followed by a 0xDD 0 in stream_sentence: firmware before
@@ -1519,8 +1527,17 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
     device.processing = True
     device.interrupted.clear()
     barge.new_turn()
+    answer_pcm = None
+    if req["wav"] is not None:
+        # Pre-rendered audio (say "wav"): one "sentence", its label used for
+        # the SEND line, debug WAV and log; played instead of the TTS, in
+        # 0.5 s chunks like streamed TTS.
+        wav = req["wav"]
+        answer_pcm = [wav[i:i + 16000] for i in range(0, len(wav), 16000)]
     try:
-        sentences = [s async for s in sentence_chunks(_one_delta(req["text"]))]
+        sentences = ([req["text"] or f"[wav {len(req['wav']) / 32000:.1f}s]"]
+                     if answer_pcm is not None else
+                     [s async for s in sentence_chunks(_one_delta(req["text"]))])
         filler_sentences = []
         if req["filler"]:
             filler_sentences = [s async for s in sentence_chunks(_one_delta(req["filler"]))]
@@ -1529,10 +1546,11 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
         device.say_active = False
         raise
     task = asyncio.create_task(play_say(
-        config, scfg, device, sentences, req["text"], tts_voice, bot,
+        config, scfg, device, sentences, req["text"] or sentences[0], tts_voice, bot,
         listen=req["listen"], filler_sentences=filler_sentences,
         filler_text=req["filler"], think_s=req["think_s"], delay_s=req["delay_s"],
-        barge=barge, utterance_queue=utterance_queue))
+        barge=barge, utterance_queue=utterance_queue, answer_pcm=answer_pcm,
+        tell=bool(req["text"])))
     if not req["wait"]:
         _say_tasks.add(task)
         task.add_done_callback(_say_tasks.discard)
@@ -1613,7 +1631,7 @@ async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | Non
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             try:
-                req = await _read_http_request(reader)
+                req = await _read_http_request(reader, max_body=say_mod.MAX_BODY)
                 if req is None:
                     return
                 method, path, headers, body = req

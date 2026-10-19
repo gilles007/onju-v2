@@ -23,6 +23,16 @@ Request (JSON):
      "think_s": 3,             optional: seconds of THINKING LEDs after filler
      "delay_s": 5}             optional: wait before starting (re-check busy then)
 
+Pre-rendered audio (2026-10-19): "wav": "<base64 WAV file>" plays that audio
+as the answer instead of synthesizing "text". Only the TTS step is skipped;
+busy check, voice/bot, LEDs, mic, end markers, filler/think/delay and the log
+are the same. "text" is then optional: a label for the log, and what the
+agent is told was said (tell_agent); without it nothing is told. 16-bit PCM,
+mono or stereo (downmixed), 8-48 kHz (resampled to 16 kHz), at most
+MAX_WAV_S seconds. Base64 in the JSON body keeps one request format for curl
+and for a future agent caller; a server-side file path would be lighter on
+the wire, but the container doesn't see host paths.
+
 Staged sequence when filler and/or think_s is set: optional delay → filler →
 THINKING for think_s → answer. Plain announces (text only) are unchanged.
 listen applies only after the final answer; the mic stays closed between parts.
@@ -78,6 +88,9 @@ LISTEN_GRACE_S = 1.5
 # from holding the pod for minutes.
 MAX_THINK_S = 30.0
 MAX_DELAY_S = 120.0
+# "wav" requests: stream_sentence stops a sentence at 45 s (TTS runaway cap).
+MAX_WAV_S = 45.0
+MAX_BODY = 8 * 1024 * 1024     # HTTP body cap (a 45 s 24 kHz stereo WAV in base64 fits)
 
 
 class SayError(Exception):
@@ -160,12 +173,17 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
         raise SayError(400, {"error": "body is not JSON"})
     if not isinstance(req, dict):
         raise SayError(400, {"error": "body must be a JSON object"})
-    text = req.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise SayError(400, {"error": "missing \"text\""})
-    text = " ".join(text.split())
-    if len(text) > scfg.max_chars:
-        raise SayError(400, {"error": f"text longer than {scfg.max_chars} characters"})
+    wav = None
+    if req.get("wav") is not None:
+        wav = decode_wav(req["wav"])
+        text = _opt_text(scfg, req, "text")
+    else:
+        text = req.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise SayError(400, {"error": "missing \"text\" (or \"wav\")"})
+        text = " ".join(text.split())
+        if len(text) > scfg.max_chars:
+            raise SayError(400, {"error": f"text longer than {scfg.max_chars} characters"})
     for key in ("voice", "bot", "device"):
         if req.get(key) is not None and not isinstance(req.get(key), str):
             raise SayError(400, {"error": f"\"{key}\" must be a string"})
@@ -180,7 +198,42 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
         "think_s": _opt_seconds(req, "think_s", MAX_THINK_S),
         "delay_s": _opt_seconds(req, "delay_s", MAX_DELAY_S),
         "raw_voice": bool(req.get("raw_voice", False)),
+        "wav": wav,              # 16 kHz mono s16 PCM bytes, or None
     }
+
+
+def decode_wav(b64) -> bytes:
+    """Base64 WAV -> 16 kHz mono 16-bit PCM bytes. SayError 400 when it
+    isn't a 16-bit PCM WAV, is empty, or is longer than MAX_WAV_S."""
+    import base64, binascii, io, wave
+    import numpy as np
+    if not isinstance(b64, str) or not b64:
+        raise SayError(400, {"error": "\"wav\" must be a base64 string"})
+    try:
+        data = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise SayError(400, {"error": "\"wav\" is not valid base64"})
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            ch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            raw = w.readframes(w.getnframes())
+    except (wave.Error, EOFError) as e:
+        raise SayError(400, {"error": f"not a PCM WAV file: {e}"})
+    if width != 2:
+        raise SayError(400, {"error": f"WAV must be 16-bit PCM, got {8 * width}-bit"})
+    if not 8000 <= rate <= 48000:
+        raise SayError(400, {"error": f"unsupported WAV rate {rate} Hz (8000-48000)"})
+    pcm = np.frombuffer(raw[:len(raw) // (2 * ch) * 2 * ch], dtype="<i2")
+    if pcm.size == 0:
+        raise SayError(400, {"error": "WAV has no audio"})
+    seconds = pcm.size / ch / rate
+    if seconds > MAX_WAV_S:
+        raise SayError(400, {"error": f"WAV is {seconds:.1f}s, max {MAX_WAV_S:g}s"})
+    x = pcm.reshape(-1, ch).astype(np.float32).mean(axis=1)     # downmix
+    if rate != 16000:                                           # linear resample
+        n_out = int(round(len(x) * 16000 / rate))
+        x = np.interp(np.arange(n_out) * (rate / 16000), np.arange(len(x)), x)
+    return np.clip(np.round(x), -32768, 32767).astype("<i2").tobytes()
 
 
 def resolve_voice(router, voice: str, bot: str,
