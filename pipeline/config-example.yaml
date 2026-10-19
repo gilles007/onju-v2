@@ -130,6 +130,12 @@ tts:
 vad:
   threshold: 0.5                             # speech onset probability
   neg_threshold: 0.35                        # speech offset probability (hysteresis)
+  # silence_time: end-of-utterance pause (s), decided on the server (no
+  # firmware setting): this much silence after speech ends the request and
+  # sends it off. Longer lets you hesitate mid-request without it being cut
+  # short, at the cost of that much more delay before every reply starts.
+  # Takes effect on a server restart. (Speech while the turn is still
+  # thinking is merged into it anyway, see Attention below.)
   silence_time: 1.5
   pre_buffer_s: 1.0
   # VOX barge-in (talking over the reply to interrupt it). PTT pods always
@@ -137,9 +143,12 @@ vad:
   interrupt_min_ms: 300                      # continuous speech needed to interrupt (0 = first frame over threshold)
   interrupt_only_while_playing: true         # only while the pod plays the reply, not while waiting for ASR / the agent
   # Attention (pipeline/attention.py): the voice LEDs flash exactly while the
-  # server listens to the mic. During a turn it listens only while barge-in
-  # is armed (per the two settings above); otherwise speech has no effect at
-  # all and the pod's mic is closed (0xDD 0) until the final sentence.
+  # server listens to the mic. During a turn it keeps listening until the
+  # turn's first audio (stall line or answer) starts playing: speech in that
+  # window cancels the pending request and resends it merged with what you
+  # added. From playback start it listens only while barge-in is armed (per
+  # the two settings above); otherwise speech has no effect at all and the
+  # pod's mic is closed (0xDD 0) until the final sentence reopens it.
 
 network:
   udp_port: 3000

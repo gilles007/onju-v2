@@ -36,6 +36,19 @@ class Device:
         self.processing = False     # True while ASR/LLM/TTS pipeline is running
         self.interrupted = asyncio.Event()
 
+        # Add-on while thinking (2026-10-19, pipeline/attention.py and
+        # main.py process_utterances). thinking: a VOX turn is waiting for
+        # ASR / the agent and none of its audio has started playing, so the
+        # server still listens. addon: speech in that window cancelled the
+        # turn; its words are carried into the next turn (carry_text once
+        # transcribed, else carry_audio). turn_seq: id of the current turn,
+        # so a superseded turn's late answer is never played.
+        self.thinking = False
+        self.addon = False
+        self.carry_text: str | None = None
+        self.carry_audio = None
+        self.turn_seq = 0
+
     def to_dict(self) -> dict:
         return {
             "hostname": self.hostname,
