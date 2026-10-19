@@ -29,6 +29,10 @@ main.py say_server / say_request / play_say):
   rendered before the first is sent; the answer renders during the
   filler/think phase, THINKING stays on until it is ready; a tap during
   the render sends nothing; sentence (default) and local_stream unchanged.
+- "wav" (pre-rendered audio instead of text): played through the same path
+  with no TTS call (filler still uses the TTS), 24 kHz stereo downmixed and
+  resampled to 16 kHz mono, label in say.log, listen/mic-off as for text;
+  bad base64, non-WAV, 8-bit, too long, and neither text nor wav -> 400.
 
 Reuses the stubs of tests/test_pause_flush.py. Run from the repo root:
 python3 tests/test_say.py
@@ -802,6 +806,74 @@ async def test_render_whole():
         m.fire_state = real_fire
 
 
+def make_wav(seconds, rate=16000, channels=1, width=2, value=1000):
+    import base64, io, wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        n = int(seconds * rate) * channels
+        sample = value.to_bytes(width, "little", signed=width > 1) if width > 1 else bytes([200])
+        w.writeframes(sample * n)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+async def test_wav():
+    pcm = say.decode_wav(make_wav(1.0, rate=24000, channels=2))
+    check("wav decode: 24 kHz stereo -> 16 kHz mono 16-bit (1 s = 32000 bytes), level kept",
+          len(pcm) == 32000 and int.from_bytes(pcm[100:102], "little", signed=True) == 1000,
+          f"{len(pcm)}")
+    check("wav decode: 16 kHz mono passes through unchanged",
+          say.decode_wav(make_wav(0.5)) == (1000).to_bytes(2, "little") * 8000)
+
+    async with Env() as env:
+        dev = env.devices[0]
+        st, body = await http(env.port, "POST", "/say",
+                              {"wav": make_wav(1.0), "voice": "pepper", "text": f"{TAG} from a file."})
+        await asyncio.sleep(0.2)
+        audio = env.pod.audio()
+        check("wav: 200 played, one part, no TTS call",
+              st == 200 and body["status"] == "played" and body["sentences"] == 1
+              and body["played"] == 1 and env.tts.calls == [], f"{st} {body} {env.tts.calls}")
+        check("wav: one audio connection, 2 batches of 0.5 s, mic 0 then 0xDD 0",
+              len(audio) == 1 and audio[0]["frames"] == 2 and audio[0]["mic"] == 0
+              and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd"], f"{env.pod.conns}")
+        lines = env.log_lines()
+        check("wav: say.log has the text label, pod released",
+              len(lines) == 1 and lines[0]["text"] == f"{TAG} from a file."
+              and not dev.processing and not dev.say_active, f"{lines}")
+
+    async with Env() as env:
+        st, body = await http(env.port, "POST", "/say",
+                              {"wav": make_wav(1.0, rate=24000, channels=2), "listen": True,
+                               "filler": f"{TAG} one sec.", "think_s": 0.1})
+        await asyncio.sleep(0.2)
+        audio = env.pod.audio()
+        lines = env.log_lines()
+        check("wav + filler + listen: TTS only for the filler, wav last with the mic timeout",
+              st == 200 and [c for c, _ in env.tts.calls] == [f"{TAG} one sec."]
+              and [c["mic"] for c in audio] == [0, MIC] and audio[1]["frames"] == 2,
+              f"{st} {body} {env.tts.calls} {env.pod.conns}")
+        check("wav without text: labelled [wav 1.0s] in say.log",
+              any(x["text"] == "[wav 1.0s]" for x in lines), f"{lines}")
+
+    async with Env() as env:
+        bad = [({"wav": "not base64!"}, "base64"),
+               ({"wav": "aGVsbG8="}, "not a PCM WAV"),
+               ({"wav": make_wav(0.1, width=1)}, "16-bit"),
+               ({"wav": make_wav(say.MAX_WAV_S + 1)}, "max"),
+               ({"voice": "pepper"}, "wav")]
+        results = []
+        for obj, needle in bad:
+            st, body = await http(env.port, "POST", "/say", obj)
+            results.append((st, body.get("error", "")))
+        check("wav refusals: bad base64, not a WAV, 8-bit, too long, nothing to say -> 400 "
+              "with a clear error, nothing sent",
+              all(st == 400 and needle in err for (st, err), (_, needle) in zip(results, bad))
+              and env.pod.conns == [], f"{results}")
+
+
 async def main():
     await test_disabled()
     await test_refusals()
@@ -812,6 +884,7 @@ async def main():
     test_parse_staged()
     test_render_mode()
     await test_render_whole()
+    await test_wav()
     for f in glob.glob(f"/tmp/tts-debug/*_{TAG}*.wav"):
         os.remove(f)
     total = len(pf.CHECKS)
