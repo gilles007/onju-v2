@@ -6,6 +6,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <opus.h>
+#include "play_ring.h" // (20261025) rolling playback FIFO, host-testable
 
 
 #define  WIFI_DEBUG_LEVEL  1
@@ -212,7 +213,11 @@ static void thinking_render(uint32_t ms, uint8_t out[ANIM_LEDS][3])
 }
 
 
-int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playback from TCP
+// (20261025 rolling buffer) Playback FIFO: 16-bit samples, allocated once at boot
+// (PSRAM when present). The volume shift is applied when a chunk is popped.
+int16_t *playRingBuf = NULL;
+size_t playRingAlloc = 0; // samples allocated; a stream's ring is threshold + headroom of it
+PlayRing playRing;
 
 // how many samples to load from TCP before starting playing (avoid jitter due to running out of data w/ bad wifi)
 // PSRAM boards: 1 s of pre-buffer. On a lossy pod link a single lost TCP segment
@@ -222,18 +227,28 @@ int32_t *wavData = NULL; // assign later as PSRAM (or not) as a buffer for playb
 // Streams that end before the threshold are still played (flushed at stream end).
 // (20261012 0xEF pre-buffer) On PSRAM boards the threshold is set by the server
 // with 0xEF setting id 2 (device.prebuffer_ms), PREBUFFER_MIN_MS..PREBUFFER_MAX_MS.
-// wavData is ONE linear block (not a ring): samples accumulate from index 0 until
-// the threshold, the whole block is queued to I2S, then each further TCP read /
-// Opus frame is queued as it arrives (totalSamplesRead back to 0 each time). So
-// wavData only ever needs threshold + one read/frame of headroom, and it is
-// allocated once at boot for PREBUFFER_MAX_MS: changing the setting never
-// reallocates. A stream shorter than the threshold is fully downloaded, then
-// played at stream end (effectively WAV playback, no Wi-Fi underrun possible);
-// a longer stream starts at the threshold and keeps streaming as before.
-// Non-PSRAM builds keep the fixed 64 ms and ignore id 2.
+// (20261025 rolling buffer) The pre-buffer is now a true FIFO that keeps filling
+// while it drains. Before, ONE linear block was filled to the threshold and then
+// queued to I2S in a single blocking call; TCP was not read during that call and
+// every later read was played at once, so after the first block the cushion was
+// only what fit in the TCP window (well under 1 s) and a 30 s setting only
+// protected the first 30 s. Now the playback loop (opusDecodeTask, or the PCM
+// loop in loop()) alternates every ~32 ms: (a) take whatever TCP has into the
+// ring (bounded by its free space, which also applies TCP back-pressure to the
+// server) and (b) play ONE 32 ms chunk from the ring. The ring holds up to the
+// threshold (+ one read/frame of headroom) and is refilled as it drains, so the
+// cushion stays near prebuffer_ms for the whole stream, not just at the start.
+// Playback starts when the ring reaches the threshold, or at stream end for a
+// stream shorter than that (effectively WAV playback). After a start an empty
+// ring is not re-buffered: it waits for data (silence via tx_desc_auto_clear).
+// The 5 s TCP_STALL_TIMEOUT_MS only runs while nothing is queued to play. The mic
+// holdoff clock still starts only after the ring is empty and the last chunk (plus
+// the 120 ms silence flush) has been queued, not at the last TCP packet. The ring
+// is allocated once at boot for PREBUFFER_MAX_MS: changing the setting never
+// reallocates. Non-PSRAM builds keep the fixed 64 ms and ignore id 2.
 #define PREBUFFER_DEFAULT_MS 1000
 #define PREBUFFER_MIN_MS 64
-#define PREBUFFER_MAX_MS 30000 // 480000 samples * 4 B = 1.83 MB of the 8 MB PSRAM
+#define PREBUFFER_MAX_MS 30000 // 480000 samples * 2 B = 0.96 MB of the 8 MB PSRAM
 #define SETTING_PREBUFFER 2    // 0xEF setting id (pipeline/protocol.py SETTING_PREBUFFER)
 #ifdef USE_PSRAM
 volatile int bufferThreshold = PREBUFFER_DEFAULT_MS * 16; // 1000ms @ 16kHz (50 frames @ 20ms)
@@ -364,8 +379,10 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 // 32-sample >> 8). Lower = brighter / more sensitive (9 doubles it). Clamped to
 // 255. The decay is led_fade in the server config (per 25 ms LED tick).
 #define LED_METER_SHIFT    10
+// (20261025 rolling buffer) Opus frames decoded per 32 ms playback pass (16 x 20 ms).
+#define OPUS_FRAMES_PER_PASS 16
 
-// Play n samples of wavData-format audio (int32, already << speaker_volume) and
+// Play n samples of playStage-format audio (int32, already << speaker_volume) and
 // meter it for the speaking LEDs. Checks interruptPlayback between chunks, so a
 // tap stops playback within one chunk (~32 ms of blocking). Returns false if
 // interrupted (the rest of the block is not queued).
@@ -409,6 +426,35 @@ bool playAndMeter(const int32_t *buf, size_t n)
         pos += len;
     }
     return true;
+}
+
+// (20261025 rolling buffer) One playback step: pop up to PLAY_CHUNK_SAMPLES (32 ms)
+// from the ring, apply the volume shift, meter and queue them. Blocks in i2s_write
+// for about one chunk, which paces the caller's TCP polling. Returns the number of
+// samples played (0 = nothing to play yet: still filling to the threshold, or the
+// ring is empty), or (size_t)-1 if interrupted.
+static int32_t playStage[PLAY_CHUNK_SAMPLES];
+size_t playRingStep(PlayGate &gate, size_t threshold, bool streamDone)
+{
+    if (!gate.mayPlay(playRing.count, threshold, streamDone))
+    {
+        return 0;
+    }
+    int16_t tmp[PLAY_CHUNK_SAMPLES];
+    size_t n = playRing.pop(tmp, PLAY_CHUNK_SAMPLES);
+    for (size_t i = 0; i < n; i++)
+    {
+        playStage[i] = (int32_t)tmp[i] << speaker_volume;
+    }
+    return playAndMeter(playStage, n) ? n : (size_t)-1;
+}
+
+// Ring size for a stream: the threshold plus headroom for one read/frame, so the
+// threshold is always reachable.
+size_t playRingCapacity()
+{
+    size_t cap = (size_t)bufferThreshold + OPUS_FRAME_SIZE + tcpBufferSize / 2;
+    return cap > playRingAlloc ? playRingAlloc : cap;
 }
 
 void setup()
@@ -604,7 +650,7 @@ void setup()
     i2s_set_pin(I2S_NUM, &pin_config);
 
 #ifdef USE_PSRAM
-    Serial.println("Allocating wavData - PSRAM");
+    Serial.println("Allocating playback ring - PSRAM");
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     Serial.println("PSRAM free: " + String(free_psram));
@@ -612,9 +658,10 @@ void setup()
     Serial.println("PSRAM used: " + String(total_psram - free_psram));
 
     // (20261012) sized for the largest pre-buffer (0xEF id 2) + one Opus frame or
-    // PCM read of headroom (previously a fixed 2 MB, which also covered 30 s).
-    wavData = (int32_t *)ps_malloc((PREBUFFER_MAX_MS * 16 + OPUS_FRAME_SIZE + tcpBufferSize / 2) * sizeof(int32_t));
-    if (wavData == NULL)
+    // PCM read of headroom. (20261025) 16-bit samples: 0.96 MB instead of 1.83 MB.
+    playRingAlloc = PREBUFFER_MAX_MS * 16 + OPUS_FRAME_SIZE + tcpBufferSize / 2;
+    playRingBuf = (int16_t *)ps_malloc(playRingAlloc * sizeof(int16_t));
+    if (playRingBuf == NULL)
     {
         Serial.println("Memory allocation failed!");
         while (1)
@@ -627,10 +674,11 @@ void setup()
     free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     Serial.println("PSRAM used: " + String(total_psram - free_psram));
 #else
-    Serial.println("Allocating wavData - no PSRAM");
+    Serial.println("Allocating playback ring - no PSRAM");
     // threshold + headroom: one Opus frame (320) or one PCM read (tcpBufferSize/2)
     // can be appended past the threshold before it is drained
-    wavData = (int32_t *)malloc((bufferThreshold + OPUS_FRAME_SIZE + tcpBufferSize / 2) * sizeof(int32_t));
+    playRingAlloc = bufferThreshold + OPUS_FRAME_SIZE + tcpBufferSize / 2;
+    playRingBuf = (int16_t *)malloc(playRingAlloc * sizeof(int16_t));
 #endif
 
     // Initialize Opus decoder
@@ -830,12 +878,9 @@ void loop()
 
                 isPlaying = true;
 
-                bool initialBufferFilled = false;
                 uint32_t tic = millis();
-                size_t totalSamplesRead = 0;
 
                 size_t bytesAvailable, bytesToRead, bytesRead;
-                int16_t sample16;
                 bool wasInterrupted = false;
 
                 // Handle Opus compressed audio
@@ -882,8 +927,15 @@ void loop()
                 // Handle PCM audio (compression_type == 0)
                 else
                 {
-                    unsigned long pcmReadStart = millis();
-                    while (client.connected())
+                    // (20261025 rolling buffer) Same loop shape as opusDecodeTask: each
+                    // pass takes what TCP has into the ring, then plays one 32 ms chunk.
+                    // (The server currently sends Opus only; this path is kept working.)
+                    playRing.begin(playRingBuf, playRingCapacity());
+                    const size_t threshold = bufferThreshold;
+                    PlayGate gate;
+                    bool streamDone = false;
+                    unsigned long lastProgress = millis(); // last byte received or chunk played
+                    while (true)
                     {
                         if (interruptPlayback)
                         {
@@ -891,57 +943,75 @@ void loop()
                             break;
                         }
 
-                        bytesAvailable = client.available();
-
-                        if (bytesAvailable >= 2)
+                        // (a) intake, bounded by free ring space (2 bytes per sample)
+                        if (!streamDone)
                         {
+                            bytesAvailable = client.available();
                             bytesToRead = (bytesAvailable / 2) * 2;
                             if (bytesToRead > tcpBufferSize)
                             {
                                 bytesToRead = tcpBufferSize;
                             }
-
-                            bytesRead = client.read(tcpBuffer, bytesToRead);
-                            pcmReadStart = millis();
-
-                            for (size_t i = 0; i < bytesRead; i += 2)
+                            if (bytesToRead > playRing.freeSpace() * 2)
                             {
-                                sample16 = (tcpBuffer[i + 1] << 8) | tcpBuffer[i];
-                                wavData[totalSamplesRead++] = (int32_t)sample16 << speaker_volume;
+                                bytesToRead = playRing.freeSpace() * 2;
                             }
-                            if (initialBufferFilled || totalSamplesRead >= bufferThreshold)
+                            if (bytesToRead >= 2)
                             {
-                                if (!initialBufferFilled)
+                                bytesRead = client.read(tcpBuffer, bytesToRead);
+                                lastProgress = millis();
+                                int16_t pcm16[tcpBufferSize / 2];
+                                size_t ns = bytesRead / 2;
+                                for (size_t i = 0; i < ns; i++)
                                 {
-                                    Serial.println("Initial buffer filled. totalSamplesRead: " + String(totalSamplesRead));
-                                    initialBufferFilled = true;
+                                    pcm16[i] = (int16_t)((tcpBuffer[2 * i + 1] << 8) | tcpBuffer[2 * i]);
                                 }
-
-                                playAndMeter(wavData, totalSamplesRead);
-                                totalSamplesRead = 0;
+                                playRing.push(pcm16, ns);
+                            }
+                            else if (bytesAvailable < 2 && !client.connected())
+                            {
+                                streamDone = true; // closed by the server, nothing left to read
                             }
                         }
-                        else if (millis() - pcmReadStart > TCP_STALL_TIMEOUT_MS)
+
+                        // (b) play one chunk (starts at the threshold, or at stream end)
+                        bool wasStarted = gate.started;
+                        size_t played = playRingStep(gate, threshold, streamDone);
+                        if (played == (size_t)-1)
                         {
-                            // TCP froze with connection still open — force-close so we
-                            // don't loop the I2S DMA buffer indefinitely.
+                            break; // interrupted: the cleanup below clears the ring
+                        }
+                        if (!wasStarted && gate.started)
+                        {
+                            Serial.println("Initial buffer filled. samples queued: " + String(playRing.count + played));
+                        }
+                        if (played > 0)
+                        {
+                            lastProgress = millis();
+                        }
+                        else if (streamDone && playRing.count == 0)
+                        {
+                            break; // ring fully drained
+                        }
+                        else if (!streamDone && millis() - lastProgress > TCP_STALL_TIMEOUT_MS)
+                        {
+                            // TCP froze with connection still open and nothing is
+                            // queued to play (or the pre-buffer never filled): force-close
+                            // so we don't loop the I2S DMA buffer indefinitely. Whatever
+                            // is in the ring is still played out, then the loop ends.
                             Serial.println("PCM playback: TCP stalled, closing connection");
                             client.stop();
-                            break;
+                            streamDone = true;
                         }
-                        else
+                        else if (playRing.freeSpace() == 0 || client.available() < 2)
                         {
-                            delay(2);
+                            delay(2); // nothing to do until TCP delivers or the ring drains
                         }
                     }
 
-                    // Stream ended before the pre-buffer threshold was reached (short
-                    // sentence, or a stall): play what we have instead of dropping it.
-                    if (!interruptPlayback && totalSamplesRead > 0)
+                    if (interruptPlayback)
                     {
-                        Serial.println("PCM stream ended before buffer threshold, playing " + String(totalSamplesRead) + " samples");
-                        playAndMeter(wavData, totalSamplesRead);
-                        totalSamplesRead = 0;
+                        playRing.clear(); // (20261025) a tap drops whatever was queued
                     }
 
                     wasInterrupted = interruptPlayback;
@@ -1173,12 +1243,21 @@ void opusDecodeTask(void *pvParameters)
         return;
     }
 
-    bool initialBufferFilled = false;
-    size_t totalSamplesRead = 0;
+    // (20261025 rolling buffer) Single-threaded loop, one pass about every 32 ms:
+    // (a) take what TCP has into the playback ring and decode every whole Opus
+    // frame in it (non-blocking: a half-received frame just waits for the next
+    // pass), (b) play ONE 32 ms chunk from the ring. See the PREBUFFER comment.
+    playRing.begin(playRingBuf, playRingCapacity());
+    const size_t threshold = bufferThreshold;
+    PlayGate gate;
+    OpusFrameRx rx;
+    rx.begin(opus_packet_buffer, OPUS_MAX_PACKET);
+    bool streamDone = false;          // no more audio will arrive (marker, close, bad stream, stall)
     bool gotEndMarker = false;        // (20261019) stream ended with frame_len == 0
     uint32_t samplesDecoded = 0;      // (20261019) whole stream, for the log below
+    unsigned long lastProgress = millis(); // last byte received or chunk played (stall clock)
 
-    while (client->connected() || client->available())
+    while (true)
     {
         // Check for user interrupt
         if (interruptPlayback)
@@ -1186,106 +1265,98 @@ void opusDecodeTask(void *pvParameters)
             Serial.println("Playback interrupted by user");
             break;
         }
-        // Read 2-byte frame length (ensure both bytes are read)
-        uint8_t len_bytes[2];
-        size_t len_read = 0;
-        unsigned long readStart = millis();
-        while (len_read < 2)
+
+        // (a) intake. At most OPUS_FRAMES_PER_PASS frames per pass (~16 ms of
+        // decode) so playback is never starved by a large TCP backlog, and only
+        // while the ring has room for another frame (otherwise TCP back-pressure
+        // holds the rest on the server).
+        bool tookBytes = false;
+        if (!streamDone)
         {
-            if (interruptPlayback) break;
-            if (client->available() > 0)
+            int frames = 0;
+            while (frames < OPUS_FRAMES_PER_PASS && playRing.freeSpace() >= OPUS_FRAME_SIZE)
             {
-                len_read += client->read(len_bytes + len_read, 2 - len_read);
+                int avail = client->available();
+                if (avail <= 0) break;
+                size_t want = rx.wanted();
+                int r = client->read(rx.dst(), (size_t)avail < want ? (size_t)avail : want);
+                if (r <= 0) break;
+                tookBytes = true;
+                lastProgress = millis();
+                OpusRxEvent ev = rx.feed((size_t)r);
+                if (ev == OPUS_RX_MORE) continue;
+                if (ev == OPUS_RX_END)
+                {
+                    // frame_len == 0 is the end-of-speech signal from the bridge
+                    Serial.println("End of speech marker received");
+                    gotEndMarker = true;
+                    streamDone = true;
+                    break;
+                }
+                if (ev == OPUS_RX_BAD_LEN)
+                {
+                    Serial.printf("Invalid Opus frame length: %u, skipping rest of stream\n", (unsigned)rx.frameLen);
+                    // Drain remaining TCP data to avoid corrupting next connection
+                    while (client->available()) client->read();
+                    streamDone = true;
+                    break;
+                }
+                // OPUS_RX_FRAME: decode into the ring
+                int num_samples = opus_decode(opus_decoder, opus_packet_buffer, (opus_int32)rx.frameLen,
+                                              opus_pcm_buffer, OPUS_FRAME_SIZE, 0);
+                frames++;
+                if (num_samples < 0)
+                {
+                    Serial.printf("Opus decode error: %d\n", num_samples);
+                    continue;
+                }
+                playRing.push(opus_pcm_buffer, (size_t)num_samples);
+                samplesDecoded += num_samples;
             }
-            else if (!client->connected())
+            if (!streamDone && client->available() <= 0 && !client->connected())
             {
-                break;
-            }
-            else if (millis() - readStart > TCP_STALL_TIMEOUT_MS)
-            {
-                // TCP froze with connection still open — force-close so the outer
-                // loop bails instead of looping the I2S DMA buffer indefinitely.
-                Serial.println("Opus task: TCP stalled waiting for frame length, closing connection");
-                client->stop();
-                break;
-            }
-            else
-            {
-                delay(1);
+                streamDone = true; // closed by the server with nothing left to read
+                if (rx.midFrame())
+                {
+                    Serial.println("Opus task: stream closed mid-frame, partial frame dropped");
+                }
             }
         }
-        if (interruptPlayback || len_read < 2) break;
-        uint16_t frame_len = (len_bytes[0] << 8) | len_bytes[1];
 
-        // frame_len == 0 is the end-of-speech signal from the bridge
-        if (frame_len == 0)
+        // (b) play one chunk. Starts at the threshold, or at stream end for a
+        // stream shorter than it.
+        bool wasStarted = gate.started;
+        size_t played = playRingStep(gate, threshold, streamDone);
+        if (played == (size_t)-1)
         {
-            Serial.println("End of speech marker received");
-            gotEndMarker = true;
-            break;
+            break; // interrupted mid-chunk
         }
-        if (frame_len > OPUS_MAX_PACKET)
+        if (!wasStarted && gate.started)
         {
-            Serial.printf("Invalid Opus frame length: %d, skipping rest of stream\n", frame_len);
-            // Drain remaining TCP data to avoid corrupting next connection
-            while (client->available()) client->read();
-            break;
+            Serial.println("Initial buffer filled. samples queued: " + String(playRing.count + played));
         }
-
-        // Read Opus frame
-        size_t bytes_read = 0;
-        unsigned long frameReadStart = millis();
-        while (bytes_read < frame_len && (client->connected() || client->available()))
+        if (played > 0)
         {
-            if (interruptPlayback) break;
-            int avail = client->available();
-            if (avail > 0)
-            {
-                int to_read = min(avail, (int)(frame_len - bytes_read));
-                bytes_read += client->read(opus_packet_buffer + bytes_read, to_read);
-                frameReadStart = millis();
-            }
-            else if (millis() - frameReadStart > TCP_STALL_TIMEOUT_MS)
-            {
-                Serial.println("Opus task: TCP stalled mid-frame, closing connection");
-                client->stop();
-                break;
-            }
-            else
-            {
-                delay(1);
-            }
+            lastProgress = millis();
         }
-        if (interruptPlayback || bytes_read < frame_len) break;  // incomplete frame, disconnect, or interrupt
-
-        // Decode Opus frame
-        int num_samples = opus_decode(opus_decoder, opus_packet_buffer, frame_len,
-                                      opus_pcm_buffer, OPUS_FRAME_SIZE, 0);
-
-        if (num_samples < 0)
+        else if (streamDone && playRing.count == 0)
         {
-            Serial.printf("Opus decode error: %d\n", num_samples);
-            continue;
+            break; // ring fully drained: the last chunk is queued
         }
-
-        // Convert to 32-bit and apply volume
-        for (int i = 0; i < num_samples; i++)
+        else if (!streamDone && millis() - lastProgress > TCP_STALL_TIMEOUT_MS)
         {
-            wavData[totalSamplesRead++] = (int32_t)opus_pcm_buffer[i] << speaker_volume;
+            // TCP froze with connection still open and nothing is queued to play
+            // (or the pre-buffer never filled). While audio is queued the clock
+            // keeps being reset above, so a stall only counts once the ring is
+            // empty. Force-close so we don't loop the I2S DMA buffer indefinitely;
+            // what is in the ring is still played out first.
+            Serial.println("Opus task: TCP stalled, closing connection");
+            client->stop();
+            streamDone = true;
         }
-        samplesDecoded += num_samples;
-
-        // Start draining once we have reservoir
-        if (initialBufferFilled || totalSamplesRead >= bufferThreshold)
+        else if (!tookBytes)
         {
-            if (!initialBufferFilled)
-            {
-                Serial.println("Initial buffer filled. totalSamplesRead: " + String(totalSamplesRead));
-                initialBufferFilled = true;
-            }
-
-            playAndMeter(wavData, totalSamplesRead);
-            totalSamplesRead = 0;
+            delay(1); // nothing to play and nothing arrived: yield
         }
     }
 
@@ -1300,21 +1371,13 @@ void opusDecodeTask(void *pvParameters)
 
     if (interruptPlayback)
     {
+        playRing.clear(); // (20261025) a tap drops whatever was queued
         i2s_zero_dma_buffer(I2S_NUM);
     }
-    else
-    {
-        // Stream ended before the pre-buffer threshold was reached (short sentence,
-        // or a stall): play what we have instead of dropping it.
-        if (totalSamplesRead > 0)
-        {
-            Serial.printf("Stream ended before buffer threshold, playing %u samples\n", (unsigned)totalSamplesRead);
-            playAndMeter(wavData, totalSamplesRead);
-            totalSamplesRead = 0;
-        }
-        // No zeroing here: the last ~128 ms still in the DMA ring is real audio. The
-        // caller flushes silence behind it, and tx_desc_auto_clear keeps it silent after.
-    }
+    // else: no zeroing here, the last ~128 ms still in the DMA ring is real audio.
+    // (20261025) The ring is empty and its last chunk is queued by now, so the
+    // caller's 120 ms silence flush and mic holdoff clock start behind the audio
+    // itself, not at the last TCP packet. tx_desc_auto_clear keeps the DMA silent after.
     Serial.println("Opus decode task finished");
     opusTaskRunning = false;
     vTaskDelete(NULL);
