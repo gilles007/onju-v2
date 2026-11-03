@@ -902,6 +902,55 @@ async def test_wav():
               and say.MEMORY.take(hostname, bot) is None, f"{st} {body} {note}")
 
 
+# ---- default target = pod heard from last (not the one added last) ---------
+
+def _real_device_manager():
+    # pipeline.device is stubbed by test_pause_flush; load the real file
+    # (its own imports, conversation/vad, resolve to the stubs).
+    spec = importlib.util.spec_from_file_location(
+        "real_pipeline_device", os.path.join(os.path.dirname(__file__), "..", "pipeline", "device.py"))
+    mod = importlib.util.module_from_spec(spec)
+    stubs = {"pipeline.conversation": types.SimpleNamespace(ConversationBackend=object,
+                                                            create_backend=lambda *a: None),
+             "pipeline.vad": types.SimpleNamespace(VAD=lambda *a: None)}
+    saved = {k: sys.modules.get(k) for k in stubs}
+    sys.modules.update(stubs)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    return mod.DeviceManager
+
+
+def test_default_target_is_last_heard_not_last_added():
+    DeviceManager = _real_device_manager()
+    from pipeline import say as say_mod
+    mgr = DeviceManager({})
+    live = types.SimpleNamespace(hostname="onju-1415E8", last_heard_at=100.0)
+    stale = types.SimpleNamespace(hostname="onju-1415C8", last_heard_at=0.0)
+    mgr.devices = {"onju-1415E8": live, "onju-1415C8": stale}   # stale added last
+    pf.check("default target", mgr.get_most_recent() is live)
+    pf.check("default target", say_mod.find_device(mgr, "") is live)
+    stale.last_heard_at = 200.0
+    pf.check("default target", mgr.get_most_recent() is stale)
+    # explicit SAY_DEVICE-style name still wins over last-heard
+    pf.check("default target", say_mod.find_device(mgr, "onju-1415E8") is live)
+
+
+def test_default_target_ties_go_to_last_added():
+    DeviceManager = _real_device_manager()
+    mgr = DeviceManager({})
+    a = types.SimpleNamespace(hostname="a", last_heard_at=0.0)
+    b = types.SimpleNamespace(hostname="b", last_heard_at=0.0)
+    mgr.devices = {"a": a, "b": b}
+    pf.check("default target", mgr.get_most_recent() is b)
+    pf.check("default target", DeviceManager({}).get_most_recent() is None)
+
+
 async def main():
     await test_disabled()
     await test_refusals()
@@ -913,6 +962,8 @@ async def main():
     test_render_mode()
     await test_render_whole()
     await test_wav()
+    test_default_target_is_last_heard_not_last_added()
+    test_default_target_ties_go_to_last_added()
     for f in glob.glob(f"/tmp/tts-debug/*_{TAG}*.wav"):
         os.remove(f)
     total = len(pf.CHECKS)
@@ -924,3 +975,4 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.WARNING)
     sys.exit(asyncio.run(main()))
+

@@ -30,6 +30,8 @@ class Device:
         self.led_update_time = 0.0
         self.last_mic_at = 0.0      # time.time() of the last mic packet (say busy check)
         self.say_active = False     # a POST /say is playing (pipeline/say.py)
+        self.last_heard_at = 0.0    # time.time() of the last packet FROM the pod (UDP mic/VOX,
+                                    # multicast announce); picks the default /say target
 
         # PTT state
         self.ptt_buffer: list = []  # raw PCM frames during PTT
@@ -67,7 +69,8 @@ class DeviceManager:
         self.config = config
         self.devices: dict[str, Device] = {}
 
-    def create_device(self, hostname: str, ip: str, ptt: bool = False) -> Device:
+    def create_device(self, hostname: str, ip: str, ptt: bool = False,
+                      heard: bool = False) -> Device:
         device = self.devices.get(hostname)
         if device is None:
             conv = create_backend(self.config, hostname)
@@ -79,6 +82,8 @@ class DeviceManager:
             log.debug(f"Updated {hostname} IP to {ip}")
         else:
             log.debug(f"Device {hostname} reconnected ({ip})")
+        if heard:
+            device.last_heard_at = time.time()
         return device
 
     def get_by_ip(self, ip: str) -> Device | None:
@@ -88,6 +93,11 @@ class DeviceManager:
         return None
 
     def get_most_recent(self) -> Device | None:
-        if self.devices:
-            return next(reversed(self.devices.values()))
-        return None
+        """The pod we most recently HEARD from (any packet it sent), not the
+        one added last: a stale manual/control entry (onju-1415C8) must not
+        steal announces. Ties (e.g. nothing heard yet) go to the later-added."""
+        best = None
+        for d in self.devices.values():
+            if best is None or getattr(d, "last_heard_at", 0.0) >= getattr(best, "last_heard_at", 0.0):
+                best = d
+        return best

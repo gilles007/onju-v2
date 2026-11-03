@@ -270,6 +270,8 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
         now = time.time()
         last_packet_time[device.hostname] = now
         device.last_mic_at = now   # mic open: the say endpoint counts it as busy
+        if addr[0] != "127.0.0.1":
+            device.last_heard_at = now  # default /say target = pod heard from last
         pcm = decode_ulaw(data)
 
         if device.ptt:
@@ -517,7 +519,7 @@ async def multicast_listener(config: dict, manager: DeviceManager):
         hostname = parts[0]
         ptt = "PTT" in (p.upper() for p in parts)
         log.info(f"DEVICE  {hostname} ({addr[0]}) {'PTT' if ptt else 'VOX'}")
-        device = manager.create_device(hostname, addr[0], ptt=ptt)
+        device = manager.create_device(hostname, addr[0], ptt=ptt, heard=True)
         await greet_device(device, config)
 
 
