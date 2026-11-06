@@ -4,6 +4,7 @@ import time
 
 from pipeline.conversation import ConversationBackend, create_backend
 from pipeline.vad import VAD
+from pipeline.away import mute_state
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ class Device:
         self.last_heard_at = 0.0    # time.time() of the last packet FROM the pod (UDP mic/VOX,
                                     # multicast announce); picks the default /say target
 
+        self.away = False
+        self.away_since = None
+        self.mute_received_at = 0.0
+
         # PTT state
         self.ptt_buffer: list = []  # raw PCM frames during PTT
         self.processing = False     # True while ASR/LLM/TTS pipeline is running
@@ -57,6 +62,8 @@ class Device:
             "ip": self.ip,
             "voice": self.voice,
             "ptt": self.ptt,
+            "away": mute_state(self),
+            "away_since": self.away_since if mute_state(self) else None,
         }
 
     def __repr__(self):
@@ -70,11 +77,12 @@ class DeviceManager:
         self.devices: dict[str, Device] = {}
 
     def create_device(self, hostname: str, ip: str, ptt: bool = False,
-                      heard: bool = False) -> Device:
+                      heard: bool = False, status_only: bool = False) -> Device:
         device = self.devices.get(hostname)
         if device is None:
             conv = create_backend(self.config, hostname)
             device = Device(hostname, ip, self.config, conversation=conv, ptt=ptt)
+            device.status_only = status_only
             self.devices[hostname] = device
             log.debug(f"New device: {device}")
         elif device.ip != ip:
@@ -82,6 +90,15 @@ class DeviceManager:
             log.debug(f"Updated {hostname} IP to {ip}")
         else:
             log.debug(f"Device {hostname} reconnected ({ip})")
+        # A MUTE packet may beat boot presence (which carries PTT mode).
+        # Only that provisional entry needs its mode completed; never reset
+        # an established device's voice/conversation on periodic status.
+        if not status_only and getattr(device, "status_only", False):
+            device.ptt = ptt
+            device.vad = None if ptt else device.vad
+            if ptt:
+                device.voice = self.config["tts"].get("elevenlabs", {}).get("default_voice_ptt") or device.voice
+            device.status_only = False
         if heard:
             device.last_heard_at = time.time()
         return device

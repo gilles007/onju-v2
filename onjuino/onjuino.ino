@@ -49,7 +49,6 @@
 #include "audio_compression.h"
 
 #define TOUCH_EN
-#define DISABLE_HARDWARE_MUTE  // Temporary: disable mute switch check
 
 // Wi-Fi settings - edit these in credentials.h
 Preferences preferences;
@@ -293,7 +292,49 @@ int16_t convertedMicBuffer[SAMPLE_CHUNK_SIZE]; // For converted values to be sen
 // Audio compression
 #define USE_COMPRESSION true        // Enable μ-law compression (2x bandwidth reduction)
 
-bool mute = false; // track state of mute button
+volatile bool mute = false; // read by mic/LED/touch tasks
+volatile bool mutedTapFlash = false;
+volatile uint32_t mutedTapStart = 0;
+
+#ifndef BOARD_V1
+void muteTask(void *parameter)
+{
+    WiFiUDP statusUdp; // separate socket: never share micTask's packet buffer
+    bool candidate = mute;
+    uint32_t changedAt = millis(), sentAt = 0;
+    bool first = true;
+    while (1)
+    {
+        uint32_t now = millis();
+        bool pinMuted = digitalRead(MUTE) == HIGH;
+        if (pinMuted != candidate) {
+            candidate = pinMuted;
+            changedAt = now;
+        }
+        bool changed = candidate != mute && now - changedAt >= 50;
+        if (changed) {
+            mute = candidate;
+            mutedTapFlash = false;
+            if (mute) {
+                mic_timeout = 0;
+                setLed(255, 0, 0, 255, 2); // slow red fade
+            } else {
+                setLed(0, 255, 50, 255, 10);
+                mic_timeout = now + 60000; // preserve 60 s listen on unmute
+            }
+        }
+        if (first || changed || now - sentAt >= 10000) {
+            String packet = String(WiFi.getHostname()) + " MUTE " + (mute ? "1" : "0");
+            statusUdp.beginPacket(ADDR_MULTICAST, PORT_MULTICAST);
+            statusUdp.write(reinterpret_cast<const uint8_t *>(packet.c_str()), packet.length());
+            statusUdp.endPacket();
+            sentAt = now;
+            first = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+#endif
 
 uint8_t compressedMicBuffer[SAMPLE_CHUNK_SIZE]; // For μ-law compressed audio
 
@@ -693,6 +734,14 @@ void setup()
         Serial.println("Opus decoder initialized");
     }
 
+#ifndef BOARD_V1
+    mute = digitalRead(MUTE) == HIGH; // before micTask can capture a boot packet
+    if (mute) {
+        mic_timeout = 0;
+        setLed(255, 0, 0, 255, 2);
+    }
+    xTaskCreatePinnedToCore(muteTask, "MuteTask", 3072, NULL, 1, NULL, 1);
+#endif
     xTaskCreatePinnedToCore(micTask, "MicTask", 4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(updateLedTask, "updateLedTask", 3072, NULL, 2, NULL, 1); // 3072: float math (powf/cosf) in thinking_render
     xTaskCreatePinnedToCore(touchTask, "TouchTask", 2048, NULL, 2, NULL, 1);
@@ -700,20 +749,6 @@ void setup()
 
 void loop()
 {
-#if !defined(BOARD_V1) && !defined(DISABLE_HARDWARE_MUTE)
-    if (digitalRead(MUTE) && !mute)
-    {
-        mute = true;
-        setLed(255, 50, 0, 255, 2); // slow fade red
-        mic_timeout = 0; // Turn off mic when muted
-    }
-    else if (!digitalRead(MUTE) && mute)
-    {
-        mute = false;
-        setLed(0, 255, 50, 255, 10); // faster fade green
-        mic_timeout = millis() + 60000; // 60s timeout when unmuted
-    }
-#endif
 
     // THINKING timeout (see THINKING_TIMEOUT_MS). Done here rather than in
     // updateLedTask so visualState keeps a single writer (loop()).
@@ -1445,6 +1480,7 @@ void micTask(void *pvParameters)
         {
             size_t bytesRead = 0;
             i2s_read(I2S_NUM, micBuffer, sizeof(micBuffer), &bytesRead, portMAX_DELAY);
+            if (mute) continue; // switch may change during the blocking read
 
             // Convert to 16-bit and remove DC offset with IIR filter
             for (int i = 0; i < SAMPLE_CHUNK_SIZE; i++)
@@ -1503,6 +1539,23 @@ void updateLedTask(void *parameter)
     while (1)
     {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+        // Muted tap: red 150 ms, dark 150 ms, red 150 ms, then dark.
+        // LED-task timing avoids blocking touch, mic, or the playback loop.
+        if (mutedTapFlash) {
+            uint32_t elapsed = millis() - mutedTapStart;
+            bool on = elapsed < 150 || (elapsed >= 300 && elapsed < 450);
+            leds.clear();
+            for (int i = 1; i < 5; i++)
+                leds.setPixelColor(i, on ? 255 : 0, 0, 0);
+            leds.show();
+            chaseOn = false;
+            if (elapsed >= 450 || !mute) {
+                mutedTapFlash = false;
+                ledLevel = 0;
+            }
+            continue;
+        }
 
         // 20260819 LED Thinking Animation add-on
         // Priority: 1) mute (red pulse via setLed/ledLevel), 2) playback and
@@ -1700,7 +1753,12 @@ bool handleShortPress()
 {
     Serial.println("Center touch: SHORT PRESS");
 
-    if (mute || serverIP == IPAddress(0, 0, 0, 0))
+    if (mute) {
+        mutedTapStart = millis();
+        mutedTapFlash = true;
+        return false;
+    }
+    if (serverIP == IPAddress(0, 0, 0, 0))
     {
         setLed(255, 30, 0, 255, 10);
         return false;

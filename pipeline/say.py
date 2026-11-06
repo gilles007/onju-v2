@@ -17,6 +17,7 @@ Request (JSON):
      "raw_voice": false,       optional: accepted; same as default here (no agents)
      "bot": "robin",           optional: only recorded in the say log
      "device": "onju-1415E8",  optional: hostname or IP (default: last pod seen)
+     "force": false,          optional: bypass away queue (not busy checks)
      "listen": false,          optional: open the mic after the final answer
      "wait": true,             optional: answer after it was sent (false = at once)
      "filler": "...",          optional: short line before THINKING (same voice)
@@ -49,6 +50,12 @@ Voice turns never use it.
 
 Responses: 200 {"status": "played"|"queued"|"interrupted", "duration_s", ...}
 ("played" = all audio sent; the pod is still playing the last ~duration_s);
+202 {"status": "queued_away", "text", "bot", "device", ...} while muted
+(or behind already queued announces): caller should also post the text to chat.
+Queues are in memory only (lost on restart), FIFO, at most 32 entries / 32 MiB
+per pod; 429 if full. Unmuting drains them when the pod is idle; force bypasses
+away, not busy. Stale/absent status (>35 s) is unknown and does not block new
+announces; a queued backlog waits for confirmed unmute.
 502 when the TTS or the pod connection failed;
 409 {"error": "busy", "reason": ...} when the pod is in a turn, playing,
 recording or listening (nothing is touched); 404 when no such pod is known
@@ -65,6 +72,7 @@ is played and logged, never passed to the agent: Hermes has no bridge that
 could tell a note from the user's words. grok-voice builds on this file
 (agent name -> voice in resolve_voice, and tell_agent / SayMemory).
 """
+from collections import deque
 import json
 import logging
 import os
@@ -187,7 +195,10 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
     for key in ("voice", "bot", "device"):
         if req.get(key) is not None and not isinstance(req.get(key), str):
             raise SayError(400, {"error": f"\"{key}\" must be a string"})
+    if "force" in req and not isinstance(req["force"], bool):
+        raise SayError(400, {"error": '"force" must be a boolean'})
     return {
+        "force": req.get("force", False),
         "text": text,
         "voice": (req.get("voice") or "").strip(),
         "bot": (req.get("bot") or "").strip(),
@@ -258,6 +269,24 @@ def find_device(manager, name: str):
         if d.ip == name or d.hostname.lower() == name.lower():
             return d
     return None
+
+
+def queue_away(device, body, req, bot, voice, scfg):
+    """Bounded per-pod FIFO; the caller, not onju, delivers the chat copy."""
+    queue = getattr(device, "say_queue", None)
+    if queue is None:
+        queue = device.say_queue = deque()
+    payload = json.loads(body)
+    payload.update(device=device.hostname, wait=True, voice=voice or "",
+                   bot=bot or "", raw_voice=True)
+    body = json.dumps(payload).encode()
+    if len(queue) >= 32 or sum(map(len, queue)) + len(body) > 32 * 1024 * 1024:
+        raise SayError(429, {"error": "away queue full", "device": device.hostname})
+    queue.append(body)
+    result = {"status": "queued_away", "device": device.hostname, "bot": bot,
+              "voice": voice, "text": req["text"], "queue_depth": len(queue)}
+    append_log(scfg.log_path, {**result, "duration_s": 0})
+    return 202, result
 
 
 # ---- busy check ----------------------------------------------------------
