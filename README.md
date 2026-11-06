@@ -79,8 +79,10 @@ A zero-length Opus frame (`0x00 0x00`) signals end of speech.
 
 | Core | Task | Purpose |
 |---|---|---|
-| Core 0 | Arduino loop | TCP server, touch/mute input, UART debug |
+| Core 0 | Arduino loop | TCP server, UART debug |
 | Core 1 | `micTask` | I2S read, mu-law encode, UDP send |
+| Core 1 | `muteTask` | Switch debounce and 10-second mute/away telemetry (not BOARD_V1) |
+| Core 1 | `touchTask` | Touch/tap handling |
 | Core 1 | `opusDecodeTask` | TCP read, Opus decode, I2S write (created per playback) |
 | Core 1 | `updateLedTask` | 40Hz LED refresh with gamma-corrected fade |
 
@@ -288,3 +290,34 @@ Both firmware targets support serial commands at 115200 baud:
 ## License
 
 MIT
+
+### Mute / away and announcements
+
+On boards with a mute switch (not BOARD_V1), HIGH means muted/away. The
+switch is debounced for 50 ms in a small task so playback cannot delay it.
+Mic capture/transmission stops locally; server availability is not needed.
+Mute gives a slow red fade; unmute gives a green fade and retains the existing
+60-second mic-open window. A muted tap does not open the mic: the four middle
+LEDs flash red for 150 ms, dark for 150 ms, red for 150 ms, then dark (LED-frame
+resolution, about 25 ms). A tap before server discovery keeps its old orange
+indication when not muted.
+
+The pod multicasts `<hostname> MUTE 0|1` at boot, on changes, and every 10 seconds
+on the presence group/port. These packets update last-heard and preserve existing
+device/voice/PTT state; they do not trigger a greeting. `/devices` exposes `away`
+(true/false/null) and `away_since` (Unix seconds, or null). Missing status for
+35 seconds makes it unknown; new announces are then allowed as with old firmware.
+
+`POST /say` while away returns HTTP 202 with `status: queued_away`, `text`, `bot`,
+`device`, `voice` and `queue_depth`, and records the same in `say.log`. **The calling
+agent should also post the text to chat**; onju has no chat connector. The in-memory
+per-device FIFO survives neither a server restart nor device removal. It holds at
+most 32 entries / 32 MiB (HTTP 429 if full), including WAV requests. Confirmed
+unmute drains it through the normal playback path, in order, waiting while busy
+(including the 60-second unmute listen window). Stale status does not auto-drain
+old entries. New requests join an existing backlog while confirmed present;
+`force: true` bypasses away/backlog, but never the normal busy checks.
+
+Later improvements (not implemented): require explicit user acknowledgement such
+as "roger that" / "got it" (not "thank you") and post unacknowledged announces to
+chat; a locally stored "Mic is muted" WAV on muted taps.

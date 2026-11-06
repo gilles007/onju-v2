@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 import numpy as np
 import yaml
 
+from pipeline.away import receive_mute, mute_state
 from pipeline import agents, attention, bargein
 from pipeline import debug_wav
 from pipeline import say as say_mod
@@ -515,6 +516,8 @@ async def multicast_listener(config: dict, manager: DeviceManager):
             log.debug(f"MCAST  ignored non-UTF8 packet from {addr[0]}")
             continue
         if not parts:
+            continue
+        if receive_mute(manager, parts, addr[0]):
             continue
         hostname = parts[0]
         ptt = "PTT" in (p.upper() for p in parts)
@@ -1567,7 +1570,7 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
 
 async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
                       utterance_queue: asyncio.Queue | None,
-                      headers: dict, body: bytes) -> tuple[int, dict]:
+                      headers: dict, body: bytes, *, from_queue=False) -> tuple[int, dict]:
     """POST /say. Returns (HTTP status, JSON body); SayError for refusals."""
     say_mod.check_token(scfg, headers)
     req = say_mod.parse_request(scfg, body)
@@ -1577,6 +1580,10 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
     if device is None:
         raise say_mod.SayError(404, {"error": "unknown pod" if req["device"] else "no pod known yet",
                                      "device": req["device"] or None})
+    away = mute_state(device)
+    if not req["force"] and not from_queue and (
+            away is True or (away is False and getattr(device, "say_queue", None))):
+        return say_mod.queue_away(device, body, req, bot, tts_voice, scfg)
     barge = bargein.for_device(device, config)
     queued = utterance_queue.qsize() if utterance_queue is not None else 0
     reason = say_mod.busy_reason(device, barge, queued)
@@ -1636,6 +1643,34 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
     return (502 if result["status"] == "failed" else 200), result
 
 
+async def flush_away_queue(config, scfg, router, manager, utterance_queue):
+    """One FIFO worker, existing /say busy checks; retry busy heads later."""
+    for device in list(manager.devices.values()):
+        queue = getattr(device, "say_queue", None)
+        if not queue or mute_state(device) is not False:
+            continue
+        try:
+            status, _ = await say_request(
+                config, scfg, router, manager, utterance_queue,
+                {"authorization": f"Bearer {scfg.token}"}, queue[0], from_queue=True)
+        except say_mod.SayError as exc:
+            status = exc.status
+            if status != 409:
+                log.warning("SAY queued announce rejected on %s: %s", device.hostname, exc.body)
+        except Exception:
+            # Do not repeatedly replay an announce that may already have spoken.
+            log.exception("SAY queued announce failed on %s", device.hostname)
+            status = 500
+        if status != 409:
+            queue.popleft()
+
+
+async def away_queue_worker(config, scfg, router, manager, utterance_queue):
+    while True:
+        await flush_away_queue(config, scfg, router, manager, utterance_queue)
+        await asyncio.sleep(1)
+
+
 _say_tasks: set[asyncio.Task] = set()   # strong refs for wait=false says
 
 
@@ -1647,6 +1682,8 @@ def say_status(config: dict, manager, utterance_queue, router) -> dict:
         devices[d.hostname] = {
             "ip": d.ip,
             "busy": say_mod.busy_reason(d, bargein.for_device(d, config), queued),
+            "away": mute_state(d),
+            "queue_depth": len(getattr(d, "say_queue", ())),
         }
     voices = {}
     if router is not None:
@@ -1676,7 +1713,8 @@ async def _read_http_request(reader: asyncio.StreamReader, max_body: int = 65536
     return parts[0].upper(), parts[1], headers, body
 
 
-_HTTP_REASONS = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
+_HTTP_REASONS = {200: "OK", 202: "Accepted", 400: "Bad Request", 401: "Unauthorized",
+                 404: "Not Found", 429: "Too Many Requests",
                  405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
                  500: "Internal Server Error", 502: "Bad Gateway"}
 
@@ -1739,8 +1777,13 @@ async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | Non
                     f"{config.get('tts', {}).get('backend')!r} (only local); rendering per sentence")
     if ready is not None:
         ready.set()
-    async with server:
-        await server.serve_forever()
+    worker = asyncio.create_task(away_queue_worker(config, scfg, router, manager, utterance_queue))
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 def _log_startup_summary(config: dict) -> None:

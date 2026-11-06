@@ -1,3 +1,8 @@
+# Pod -> server multicast UDP status: "<hostname> MUTE 0|1" at boot,
+# on switch change (50 ms debounce), and every 10 s, even before greeting.
+# HIGH switch = mic muted/user away; no ACK. Server expires status after 35 s.
+# Unlike "<hostname> <git hash> [PTT]", status does not trigger a greeting.
+
 import asyncio
 import logging
 import struct
