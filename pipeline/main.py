@@ -506,7 +506,7 @@ async def multicast_listener(config: dict, manager: DeviceManager):
     group = socket.inet_aton(mcast_group)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, group + socket.inet_aton("0.0.0.0"))
     sock.setblocking(False)
-    log.info(f"MCAST  listening on {mcast_group}:{mcast_port}")
+    log.info(f"MCAST  listening on {mcast_group}:{mcast_port} (and unicast on :{mcast_port})")
 
     while True:
         data, addr = await loop.sock_recvfrom(sock, 1024)

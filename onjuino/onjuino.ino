@@ -301,8 +301,9 @@ void muteTask(void *parameter)
 {
     WiFiUDP statusUdp; // separate socket: never share micTask's packet buffer
     bool candidate = mute;
-    uint32_t changedAt = millis(), sentAt = 0;
+    uint32_t changedAt = millis(), sentAt = 0, loggedAt = 0;
     bool first = true;
+    Serial.printf("[MUTE] boot: %s\n", mute ? "muted" : "unmuted");
     while (1)
     {
         uint32_t now = millis();
@@ -315,6 +316,7 @@ void muteTask(void *parameter)
         if (changed) {
             mute = candidate;
             mutedTapFlash = false;
+            Serial.printf("[MUTE] switch: %s\n", mute ? "muted" : "unmuted");
             if (mute) {
                 mic_timeout = 0;
                 setLed(255, 0, 0, 255, 2); // slow red fade
@@ -324,10 +326,25 @@ void muteTask(void *parameter)
             }
         }
         if (first || changed || now - sentAt >= 10000) {
+            // Unicast to the server once known (TCP greeting, NVS or mDNS),
+            // multicast before that. Same port: the server listens on
+            // INADDR_ANY:PORT_MULTICAST, so it gets both.
+            IPAddress dst = serverIP;
+            bool unicast = dst != IPAddress(0, 0, 0, 0);
+            if (!unicast) dst = ADDR_MULTICAST;
             String packet = String(WiFi.getHostname()) + " MUTE " + (mute ? "1" : "0");
-            statusUdp.beginPacket(ADDR_MULTICAST, PORT_MULTICAST);
-            statusUdp.write(reinterpret_cast<const uint8_t *>(packet.c_str()), packet.length());
-            statusUdp.endPacket();
+            bool ok = statusUdp.beginPacket(dst, PORT_MULTICAST);
+            if (ok) {
+                statusUdp.write(reinterpret_cast<const uint8_t *>(packet.c_str()), packet.length());
+                ok = statusUdp.endPacket();
+            }
+            // Boot, changes and failures always; the 10 s refresh once a minute.
+            if (first || changed || !ok || now - loggedAt >= 60000) {
+                Serial.printf("[MUTE] sent MUTE %d %s %s:%d%s\n", mute ? 1 : 0,
+                              unicast ? "unicast" : "multicast", dst.toString().c_str(),
+                              PORT_MULTICAST, ok ? "" : " FAILED");
+                loggedAt = now;
+            }
             sentAt = now;
             first = false;
         }
@@ -740,7 +757,7 @@ void setup()
         mic_timeout = 0;
         setLed(255, 0, 0, 255, 2);
     }
-    xTaskCreatePinnedToCore(muteTask, "MuteTask", 3072, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(muteTask, "MuteTask", 4096, NULL, 1, NULL, 1);
 #endif
     xTaskCreatePinnedToCore(micTask, "MicTask", 4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(updateLedTask, "updateLedTask", 3072, NULL, 2, NULL, 1); // 3072: float math (powf/cosf) in thinking_render

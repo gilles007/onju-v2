@@ -294,8 +294,10 @@ LEDs flash red for 150 ms, dark for 150 ms, red for 150 ms, then dark (LED-frame
 resolution, about 25 ms). A tap before server discovery keeps its old orange
 indication when not muted.
 
-The pod multicasts `<hostname> MUTE 0|1` at boot, on changes, and every 10 seconds
-on the presence group/port. These packets update last-heard and preserve existing
+The pod sends `<hostname> MUTE 0|1` at boot, on changes, and every 10 seconds
+to the presence port: by unicast to the server IP once known, by multicast to the
+presence group before that. Serial shows `[MUTE]` lines for boot state, switch
+changes and sends (the 10-second refresh is logged once a minute). These packets update last-heard and preserve existing
 device/voice/PTT state; they do not trigger a greeting. `/devices` exposes `away`
 (true/false/null) and `away_since` (Unix seconds, or null). Missing status for
 35 seconds makes it unknown; new announces are then allowed as with old firmware.

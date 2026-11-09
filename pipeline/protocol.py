@@ -1,5 +1,6 @@
-# Pod -> server multicast UDP status: "<hostname> MUTE 0|1" at boot,
-# on switch change (50 ms debounce), and every 10 s, even before greeting.
+# Pod -> server UDP status: "<hostname> MUTE 0|1" at boot, on switch change
+# (50 ms debounce), and every 10 s, even before greeting. Sent to the
+# presence port, by unicast to the server IP once known, multicast before.
 # HIGH switch = mic muted/user away; no ACK. Server expires status after 35 s.
 # Unlike "<hostname> <git hash> [PTT]", status does not trigger a greeting.
 
