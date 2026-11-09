@@ -1,4 +1,4 @@
-"""Pod mute/away status: refreshed by multicast, unknown after 35 seconds."""
+"""Pod mute/away status: refreshed by UDP status packets, unknown after 35 seconds."""
 import logging
 import time
 
@@ -26,6 +26,7 @@ def receive_mute(manager, parts, ip):
     if len(parts) == 3 and parts[2] in ("0", "1"):
         device = manager.create_device(parts[0], ip, heard=True, status_only=True)
         away = parts[2] == "1"
+        log.debug("MUTE  %s %s from %s", parts[0], parts[2], ip)
         if not getattr(device, "mute_received_at", 0.0) or device.away != away:
             log.info("DEVICE %s AWAY %s", device.hostname, "on" if away else "off")
             device.away_since = time.time() if away else None

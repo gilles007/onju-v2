@@ -186,9 +186,32 @@ async def test_worker():
         t.get_coro().__name__ == "away_queue_worker" for t in asyncio.all_tasks()))
 
 
+async def test_unicast_socket():
+    """The real listener socket takes a unicast MUTE packet (pod -> server IP)."""
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    manager = ts._real_device_manager()({"tts": {}})
+    cfg = {"network": {"multicast_group": "239.0.0.1", "multicast_port": port}}
+    task = asyncio.create_task(m.multicast_listener(cfg, manager))
+    await asyncio.sleep(0.1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx:
+        tx.sendto(b"pod MUTE 1", ("127.0.0.1", port))
+    for _ in range(50):
+        if "pod" in manager.devices:
+            break
+        await asyncio.sleep(0.02)
+    task.cancel()
+    check("unicast MUTE reaches listener", "pod" in manager.devices
+          and mute_state(manager.devices["pod"]) is True)
+
+
 async def main():
     test_status()
     await test_listener()
+    await test_unicast_socket()
     await test_queue()
     await test_worker()
     total = len(ts.pf.CHECKS)
