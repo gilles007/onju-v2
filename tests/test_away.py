@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 import time
+import types
 import wave
 from unittest.mock import patch
 
@@ -168,7 +169,59 @@ async def test_queue():
         for _ in range(31):
             await ts.http(e.port, "POST", "/say", {"text": "Bounded."}, headers)
         status, _ = await ts.http(e.port, "POST", "/say", {"text": "Full."}, headers)
-        check("queue bounded", status == 429 and len(d.say_queue) == 32)
+        check("queue bounded, oldest dropped", status == 202 and len(d.say_queue) == 32
+              and json.loads(d.say_queue[-1][1])["text"] == "Full."
+              and json.loads(d.say_queue[0][1])["text"] == "Bounded.")
+
+
+async def test_backlog():
+    """TTL expiry, max_items, and the unmute collapse (intro + newest, own voices)."""
+    d = ts.make_device()
+    set_away(d, True)
+    away = {"ttl_s": 3600, "max_items": 5, "collapse_over": 3, "keep": 2}
+    async with ts.Env(devices=[d], away=away) as e:
+        scfg = say.SayConfig.from_config(e.config)
+        for i in range(1, 7):
+            status, r = await ts.http(e.port, "POST", "/say",
+                                      {"text": f"Update {i}.", "voice": f"v{i}", "bot": f"b{i}"})
+        check("full queue keeps newest", status == 202 and r["queue_depth"] == 5
+              and json.loads(d.say_queue[0][1])["text"] == "Update 2.")
+        d.say_queue[0] = (d.say_queue[0][0] - 3601,) + d.say_queue[0][1:]
+        with patch("pipeline.say.log.info") as logged:
+            await m.flush_away_queue(e.config, scfg, None, e.manager, e.queue)
+        check("expired dropped while muted", len(d.say_queue) == 4 and not e.tts.calls
+              and any("expired" in c.args[0] and c.args[1] == 1 for c in logged.call_args_list))
+        set_away(d, False)
+        for _ in range(4):
+            m.bargein._by_host.clear()
+            await m.flush_away_queue(e.config, scfg, None, e.manager, e.queue)
+        spoken = [(t, v) for t, v in e.tts.calls]
+        intro = " ".join(t for t, v in spoken if v == "v5" and not t.startswith("Update"))
+        check("collapse intro first", intro == "You have 4 updates. Here are the latest 2; "
+              "the rest are in the chat." and not spoken[0][0].startswith("Update"), str(spoken))
+        check("only newest played, own voices",
+              [x for x in spoken if x[0].startswith("Update")] == [("Update 5.", "v5"), ("Update 6.", "v6")])
+        check("backlog drained", not d.say_queue)
+        if hasattr(say, "MEMORY"):
+            note = say.MEMORY.take(d.hostname, "b5") or ""
+            check("intro not told to the agent", "Update 5." in note and "updates" not in note)
+    # Pure helpers: ttl 0 keeps, collapse_over 0 plays all, one-left wording.
+    q = types.SimpleNamespace(hostname="p", say_queue=None)
+    keep_all = say.SayConfig({"away": {"ttl_s": 0, "collapse_over": 0}})
+    for i in range(5):
+        say.queue_away(q, json.dumps({"text": str(i)}).encode(), {"text": str(i)}, "", "",
+                       keep_all, now=0)
+    check("ttl 0 never expires", say.prune_away(q, keep_all, now=10 ** 9) == 0)
+    check("collapse off", say.collapse_away(q, keep_all) == 0 and len(q.say_queue) == 5)
+    one = say.SayConfig({"away": {"collapse_over": 1, "keep": 1}})
+    while len(q.say_queue) > 2:
+        q.say_queue.popleft()
+    check("collapse one", say.collapse_away(q, one) == 1 and q.say_queue[0][2]
+          and "Here is the latest; the other one is" in json.loads(q.say_queue[0][1])["text"])
+    check("collapse once", say.collapse_away(q, one) == 0)
+    check("defaults", (say.SayConfig({}).away_ttl_s, say.SayConfig({}).away_max,
+                       say.SayConfig({}).away_collapse_over, say.SayConfig({}).away_keep)
+          == (86400.0, 32, 3, 3))
 
 
 async def test_worker():
@@ -213,6 +266,7 @@ async def main():
     await test_listener()
     await test_unicast_socket()
     await test_queue()
+    await test_backlog()
     await test_worker()
     total = len(ts.pf.CHECKS)
     print(f"{total - len(ts.pf.FAILS)}/{total} passed")
