@@ -183,7 +183,7 @@ async def test_backlog():
         scfg = say.SayConfig.from_config(e.config)
         for i in range(1, 7):
             status, r = await ts.http(e.port, "POST", "/say",
-                                      {"text": f"Update {i}.", "voice": f"v{i}", "bot": f"b{i}"})
+                                      {"text": f"Update {i}.", "voice": f"v{i}"})
         check("full queue keeps newest", status == 202 and r["queue_depth"] == 5
               and json.loads(d.say_queue[0][1])["text"] == "Update 2.")
         d.say_queue[0] = (d.say_queue[0][0] - 3601,) + d.say_queue[0][1:]
@@ -203,7 +203,7 @@ async def test_backlog():
               [x for x in spoken if x[0].startswith("Update")] == [("Update 5.", "v5"), ("Update 6.", "v6")])
         check("backlog drained", not d.say_queue)
         if hasattr(say, "MEMORY"):
-            note = say.MEMORY.take(d.hostname, "b5") or ""
+            note = say.MEMORY.take(d.hostname, None) or ""
             check("intro not told to the agent", "Update 5." in note and "updates" not in note)
     # Pure helpers: ttl 0 keeps, collapse_over 0 plays all, one-left wording.
     q = types.SimpleNamespace(hostname="p", say_queue=None)
