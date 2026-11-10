@@ -23,6 +23,7 @@ Request (JSON):
      "bot": "robin",           optional: only recorded in the say log
      "device": "onju-1415E8",  optional: hostname or IP (default: last pod seen)
      "force": false,          optional: bypass away queue (not busy checks)
+     "if_present": false,     optional: skip (do not queue) when the pod is away
      "listen": false,          optional: open the mic after the final answer
      "wait": true,             optional: answer after it was sent (false = at once)
      "filler": "...",          optional: short line before THINKING (same voice)
@@ -57,14 +58,18 @@ Responses: 200 {"status": "played"|"queued"|"interrupted", "duration_s", ...}
 ("played" = all audio sent; the pod is still playing the last ~duration_s);
 202 {"status": "queued_away", "text", "bot", "device", ...} while muted
 (or behind already queued announces): caller should also post the text to chat.
+200 {"status": "skipped_away", "text", "bot", "device", ...} when if_present
+is true and the pod is muted: nothing is queued (the chat already has it).
 Queues are in memory only (lost on restart), FIFO per pod. The chat is the
 record, the pod only a second output, so a queue is kept short: entries older
 than say.away.ttl_s are dropped, and when full (say.away.max_items or 32 MiB)
 the oldest is dropped to make room. Unmuting drains them when the pod is idle;
 with more than say.away.collapse_over waiting, one intro ("You have 6
 updates...") plays first, then only the newest say.away.keep, each in its own
-voice. force bypasses away, not busy. Stale/absent status (>35 s) is unknown
-and does not block new announces; a queued backlog waits for confirmed unmute.
+voice. force bypasses away, not busy; if both are set, force wins and plays.
+if_present skips only when confirmed away; a present pod with a backlog still
+queues (it will be said). Stale/absent status (>35 s) is unknown and does not
+block new announces; a queued backlog waits for confirmed unmute.
 502 when the TTS or the pod connection failed;
 409 {"error": "busy", "reason": ...} when the pod is in a turn, playing,
 recording or listening (nothing is touched); 404 when no such pod is known
@@ -219,8 +224,11 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
             raise SayError(400, {"error": f"\"{key}\" must be a string"})
     if "force" in req and not isinstance(req["force"], bool):
         raise SayError(400, {"error": '"force" must be a boolean'})
+    if "if_present" in req and not isinstance(req["if_present"], bool):
+        raise SayError(400, {"error": '"if_present" must be a boolean'})
     return {
         "force": req.get("force", False),
+        "if_present": req.get("if_present", False),
         "text": text,
         "voice": (req.get("voice") or "").strip(),
         "bot": (req.get("bot") or "").strip(),
@@ -317,6 +325,16 @@ def queue_away(device, body, req, bot, voice, scfg, now=None):
               "voice": voice, "text": req["text"], "queue_depth": len(queue)}
     append_log(scfg.log_path, {**result, "duration_s": 0})
     return 202, result
+
+
+def skip_away(device, req, bot, voice, scfg):
+    """if_present while the pod is away: do not queue, report skipped."""
+    depth = len(getattr(device, "say_queue", ()) or ())
+    result = {"status": "skipped_away", "device": device.hostname, "bot": bot,
+              "voice": voice, "text": req["text"], "queue_depth": depth}
+    append_log(scfg.log_path, {**result, "duration_s": 0})
+    log.info("SAY   skipped (away) on %s", device.hostname)
+    return 200, result
 
 
 def prune_away(device, scfg, now=None) -> int:

@@ -316,5 +316,11 @@ Here are the latest 3; the rest are in the chat."), then only the newest
 `say.away.keep` (3), each in its own voice. Stale status does not auto-drain
 old entries. New requests join an existing backlog while confirmed present;
 `force: true` bypasses away/backlog, but never the normal busy checks.
+`if_present: true` (chat echoes of a live conversation) skips instead of
+queueing when the pod is muted: HTTP 200 with `status: skipped_away`, `text`,
+`bot`, `device`, `voice` and `queue_depth` (unchanged), also recorded in
+`say.log`. Spontaneous announces omit the flag and still queue. `force` wins
+if both are set. A present pod with a backlog still queues an if_present
+request (it will be said). Stale/unknown status does not skip.
 
 Later improvement (not implemented): a locally stored "Mic is muted" WAV on muted taps.

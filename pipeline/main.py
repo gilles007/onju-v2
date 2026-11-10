@@ -1533,6 +1533,8 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
     away = mute_state(device)
     if not req["force"] and not from_queue and (
             away is True or (away is False and getattr(device, "say_queue", None))):
+        if req.get("if_present") and away is True:
+            return say_mod.skip_away(device, req, bot, tts_voice, scfg)
         return say_mod.queue_away(device, body, req, bot, tts_voice, scfg)
     barge = bargein.for_device(device, config)
     queued = utterance_queue.qsize() if utterance_queue is not None else 0

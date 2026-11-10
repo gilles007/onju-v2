@@ -261,12 +261,86 @@ async def test_unicast_socket():
           and mute_state(manager.devices["pod"]) is True)
 
 
+def test_if_present_parse():
+    scfg = say.SayConfig({"enabled": True})
+    r = say.parse_request(scfg, b'{"text": "hi."}')
+    check("parse: if_present defaults to false", r["if_present"] is False, r)
+    r = say.parse_request(scfg, b'{"text": "hi.", "if_present": true}')
+    check("parse: if_present true", r["if_present"] is True, r)
+    try:
+        say.parse_request(scfg, b'{"text": "hi.", "if_present": "true"}')
+        check("parse: if_present string raises", False)
+    except say.SayError as e:
+        check("parse: if_present string -> 400", e.status == 400
+              and "if_present" in e.body.get("error", ""), e.body)
+
+
+async def test_if_present():
+    """if_present: skip while away; default still queues; force still plays."""
+    d = ts.make_device()
+    set_away(d, True)
+    async with ts.Env(devices=[d]) as e:
+        status, r = await ts.http(e.port, "POST", "/say", {"text": "Hold this."})
+        check("default still queues while away", status == 202 and r["status"] == "queued_away"
+              and len(d.say_queue) == 1)
+        status, r = await ts.http(e.port, "POST", "/say",
+                                  {"text": "Chat echo.", "if_present": True})
+        check("if_present skips while away", status == 200 and r["status"] == "skipped_away"
+              and r["text"] == "Chat echo." and r["device"] == d.hostname
+              and r["queue_depth"] == 1, r)
+        check("if_present does not queue", len(d.say_queue) == 1
+              and json.loads(d.say_queue[0][1])["text"] == "Hold this.")
+        check("if_present no audio or TTS", not e.pod.conns and not e.tts.calls)
+        check("if_present say.log", e.log_lines()[-1]["status"] == "skipped_away"
+              and e.log_lines()[-1]["text"] == "Chat echo."
+              and e.log_lines()[-1]["device"] == d.hostname)
+        status, _ = await ts.http(e.port, "POST", "/say",
+                                  {"text": "No.", "if_present": "true"})
+        check("if_present strictly boolean", status == 400)
+        check("bad if_present does not queue", len(d.say_queue) == 1)
+        # Stale/unknown does not skip (same as a fresh announce).
+        d.mute_received_at -= 36
+        m.bargein._by_host.clear()
+        status, r = await ts.http(e.port, "POST", "/say",
+                                  {"text": "Stale.", "if_present": True})
+        check("stale if_present plays, backlog kept", status == 200 and r["status"] == "played"
+              and len(d.say_queue) == 1)
+        # Present with a backlog: if_present still queues (it will be said).
+        set_away(d, False)
+        m.bargein._by_host.clear()
+        status, r = await ts.http(e.port, "POST", "/say",
+                                  {"text": "After backlog.", "if_present": True})
+        check("if_present queues behind backlog when present",
+              status == 202 and r["status"] == "queued_away" and len(d.say_queue) == 2
+              and json.loads(d.say_queue[-1][1])["text"] == "After backlog.", r)
+        # Drain the backlog so the next if_present can play.
+        for _ in range(2):
+            m.bargein._by_host.clear()
+            await m.flush_away_queue(e.config, say.SayConfig.from_config(e.config),
+                                     None, e.manager, e.queue)
+        check("backlog drained", not d.say_queue)
+        m.bargein._by_host.clear()
+        status, r = await ts.http(e.port, "POST", "/say",
+                                  {"text": "I am here.", "if_present": True})
+        check("if_present plays when present", status == 200 and r["status"] == "played", r)
+        # force wins over if_present while away.
+        set_away(d, True)
+        m.bargein._by_host.clear()
+        depth = len(getattr(d, "say_queue", ()) or ())
+        status, r = await ts.http(e.port, "POST", "/say",
+                                  {"text": "Forced present.", "if_present": True, "force": True})
+        check("force wins over if_present", status == 200 and r["status"] == "played"
+              and len(getattr(d, "say_queue", ()) or ()) == depth)
+
+
 async def main():
     test_status()
+    test_if_present_parse()
     await test_listener()
     await test_unicast_socket()
     await test_queue()
     await test_backlog()
+    await test_if_present()
     await test_worker()
     total = len(ts.pf.CHECKS)
     print(f"{total - len(ts.pf.FAILS)}/{total} passed")
