@@ -200,6 +200,11 @@ network:
 #   render: sentence                         # sentence (default): render+play one sentence at a time;
 #                                            # whole: render all sentences, then play them back to back
 #                                            # (no gaps); only with tts.backend local, ignored otherwise
+#   away:                                    # announces queued while the pod is muted (chat is the record)
+#     ttl_s: 86400                           # drop entries older than this (default 24 h; 0 = keep)
+#     max_items: 32                          # full: the oldest is dropped
+#     collapse_over: 3                       # more than this at unmute: "You have N updates..." intro,
+#     keep: 3                                # then only the newest `keep` (collapse_over 0 = play all)
 
 audio:
   sample_rate: 16000

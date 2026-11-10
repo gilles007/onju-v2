@@ -11,6 +11,11 @@ HTTP server (main.py say_server), off unless the config enables it:
       log: "/tmp/tts-debug/say.log"
       tell_agent: true      # pass the text to the agent's next turn
       render: sentence      # or whole (tts.backend local only), see below
+      away:                 # queue while the pod is muted (all optional)
+        ttl_s: 86400        # drop queued announces older than this (0 = keep)
+        max_items: 32       # full: the oldest is dropped
+        collapse_over: 3    # more waiting at unmute: intro + newest `keep` (0 = off)
+        keep: 3
 
 Request (JSON):
     {"text": "...",            required (the answer)
@@ -53,10 +58,14 @@ Responses: 200 {"status": "played"|"queued"|"interrupted", "duration_s", ...}
 ("played" = all audio sent; the pod is still playing the last ~duration_s);
 202 {"status": "queued_away", "text", "bot", "device", ...} while muted
 (or behind already queued announces): caller should also post the text to chat.
-Queues are in memory only (lost on restart), FIFO, at most 32 entries / 32 MiB
-per pod; 429 if full. Unmuting drains them when the pod is idle; force bypasses
-away, not busy. Stale/absent status (>35 s) is unknown and does not block new
-announces; a queued backlog waits for confirmed unmute.
+Queues are in memory only (lost on restart), FIFO per pod. The chat is the
+record, the pod only a second output, so a queue is kept short: entries older
+than say.away.ttl_s are dropped, and when full (say.away.max_items or 32 MiB)
+the oldest is dropped to make room. Unmuting drains them when the pod is idle;
+with more than say.away.collapse_over waiting, one intro ("You have 6
+updates...") plays first, then only the newest say.away.keep, each in its own
+voice. force bypasses away, not busy. Stale/absent status (>35 s) is unknown
+and does not block new announces; a queued backlog waits for confirmed unmute.
 502 when the TTS or the pod connection failed;
 409 {"error": "busy", "reason": ...} when the pod is in a turn, playing,
 recording or listening (nothing is touched); 404 when no such pod is known
@@ -96,6 +105,12 @@ MAX_DELAY_S = 120.0
 # "wav" requests: stream_sentence stops a sentence at 45 s (TTS runaway cap).
 MAX_WAV_S = 45.0
 MAX_BODY = 8 * 1024 * 1024     # HTTP body cap (a 45 s 24 kHz stereo WAV in base64 fits)
+# Away queue defaults (say.away.*). Bytes cap: a few WAV announces at most.
+AWAY_TTL_S = 24 * 3600.0
+AWAY_MAX_ITEMS = 32
+AWAY_MAX_BYTES = 32 * 1024 * 1024
+AWAY_COLLAPSE_OVER = 3
+AWAY_KEEP = 3
 
 
 class SayError(Exception):
@@ -117,6 +132,13 @@ class SayConfig:
         self.log_path = str(cfg.get("log") or DEFAULT_LOG)
         self.tell_agent = bool(cfg.get("tell_agent", True))
         self.max_chars = int(cfg.get("max_chars") or DEFAULT_MAX_CHARS)
+        away = cfg.get("away") or {}
+        self.away_ttl_s = float(away.get("ttl_s", AWAY_TTL_S) or 0)
+        self.away_max = max(1, int(away.get("max_items") or AWAY_MAX_ITEMS))
+        self.away_collapse_over = max(0, int(away.get("collapse_over", AWAY_COLLAPSE_OVER) or 0))
+        self.away_keep = max(1, int(away.get("keep") or AWAY_KEEP))
+        if self.away_collapse_over:
+            self.away_keep = min(self.away_keep, self.away_collapse_over)
         self.render = str(cfg.get("render") or "sentence").strip().lower()
         if self.render not in RENDER_MODES:
             log.warning(f"SAY  unknown say.render {self.render!r}; using \"sentence\"")
@@ -313,8 +335,10 @@ def find_device(manager, name: str):
     return None
 
 
-def queue_away(device, body, req, bot, voice, scfg):
-    """Bounded per-pod FIFO; the caller, not onju, delivers the chat copy."""
+def queue_away(device, body, req, bot, voice, scfg, now=None):
+    """Bounded per-pod FIFO of (queued_at, body, intro); the caller, not onju,
+    delivers the chat copy. Full: the oldest entry is dropped."""
+    now = time.time() if now is None else now
     queue = getattr(device, "say_queue", None)
     if queue is None:
         queue = device.say_queue = deque()
@@ -322,13 +346,57 @@ def queue_away(device, body, req, bot, voice, scfg):
     payload.update(device=device.hostname, wait=True, voice=voice or "",
                    bot=bot or "", raw_voice=True)
     body = json.dumps(payload).encode()
-    if len(queue) >= 32 or sum(map(len, queue)) + len(body) > 32 * 1024 * 1024:
-        raise SayError(429, {"error": "away queue full", "device": device.hostname})
-    queue.append(body)
+    prune_away(device, scfg, now)
+    dropped = 0
+    while queue and (len(queue) >= scfg.away_max or
+                     sum(len(b) for _, b, _ in queue) + len(body) > AWAY_MAX_BYTES):
+        queue.popleft()
+        dropped += 1
+    if dropped:
+        log.info("SAY   away queue full on %s: dropped %d oldest", device.hostname, dropped)
+    queue.append((now, body, False))
     result = {"status": "queued_away", "device": device.hostname, "bot": bot,
               "voice": voice, "text": req["text"], "queue_depth": len(queue)}
     append_log(scfg.log_path, {**result, "duration_s": 0})
     return 202, result
+
+
+def prune_away(device, scfg, now=None) -> int:
+    """Drop queued announces older than away.ttl_s (the chat has them)."""
+    queue = getattr(device, "say_queue", None)
+    if not queue or not scfg.away_ttl_s:
+        return 0
+    now = time.time() if now is None else now
+    n = len(queue)
+    while queue and now - queue[0][0] > scfg.away_ttl_s:
+        queue.popleft()
+    if n - len(queue):
+        log.info("SAY   dropped %d expired away announce(s) on %s", n - len(queue), device.hostname)
+    return n - len(queue)
+
+
+def collapse_away(device, scfg) -> int:
+    """More than away.collapse_over waiting: keep the newest away.keep behind
+    one spoken intro, in the first kept announce's voice. Returns how many
+    were dropped. An intro at the head means it was done already."""
+    queue = getattr(device, "say_queue", None)
+    over, keep = scfg.away_collapse_over, scfg.away_keep
+    if not over or not queue or len(queue) <= over or queue[0][2]:
+        return 0
+    total = len(queue)
+    for _ in range(total - keep):
+        queue.popleft()
+    at, first, _ = queue[0]
+    first = json.loads(first)
+    rest = "the rest are" if total - keep > 1 else "the other one is"
+    text = (f"You have {total} updates. Here are the latest {keep}; {rest} in the chat."
+            if keep > 1 else f"You have {total} updates. Here is the latest; {rest} in the chat.")
+    intro = {"text": text, "voice": first.get("voice", ""), "bot": first.get("bot", ""),
+             "raw_voice": True, "device": device.hostname, "wait": True}
+    queue.appendleft((at, json.dumps(intro).encode(), True))
+    log.info("SAY   away backlog on %s: %d updates, playing the newest %d",
+             device.hostname, total, keep)
+    return total - keep
 
 
 # ---- busy check ----------------------------------------------------------

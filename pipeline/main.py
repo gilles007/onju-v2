@@ -1570,8 +1570,10 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
 
 async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
                       utterance_queue: asyncio.Queue | None,
-                      headers: dict, body: bytes, *, from_queue=False) -> tuple[int, dict]:
-    """POST /say. Returns (HTTP status, JSON body); SayError for refusals."""
+                      headers: dict, body: bytes, *, from_queue=False,
+                      tell: bool = True) -> tuple[int, dict]:
+    """POST /say. Returns (HTTP status, JSON body); SayError for refusals.
+    tell=False: never pass the text to the agent (away backlog intro)."""
     say_mod.check_token(scfg, headers)
     req = say_mod.parse_request(scfg, body)
     tts_voice, bot = say_mod.resolve_voice(router, req["voice"], req["bot"],
@@ -1621,7 +1623,7 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
         listen=req["listen"], filler_sentences=filler_sentences,
         filler_text=req["filler"], think_s=req["think_s"], delay_s=req["delay_s"],
         barge=barge, utterance_queue=utterance_queue, answer_pcm=answer_pcm,
-        tell=bool(req["text"])))
+        tell=tell and bool(req["text"])))
     if not req["wait"]:
         _say_tasks.add(task)
         task.add_done_callback(_say_tasks.discard)
@@ -1644,15 +1646,21 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
 
 
 async def flush_away_queue(config, scfg, router, manager, utterance_queue):
-    """One FIFO worker, existing /say busy checks; retry busy heads later."""
+    """One FIFO worker, existing /say busy checks; retry busy heads later.
+    Expired entries go first, muted or not; a long backlog collapses on unmute."""
     for device in list(manager.devices.values()):
         queue = getattr(device, "say_queue", None)
+        if queue:
+            say_mod.prune_away(device, scfg)
         if not queue or mute_state(device) is not False:
             continue
+        say_mod.collapse_away(device, scfg)
+        _, body, intro = queue[0]
         try:
             status, _ = await say_request(
                 config, scfg, router, manager, utterance_queue,
-                {"authorization": f"Bearer {scfg.token}"}, queue[0], from_queue=True)
+                {"authorization": f"Bearer {scfg.token}"}, body, from_queue=True,
+                tell=not intro)
         except say_mod.SayError as exc:
             status = exc.status
             if status != 409:

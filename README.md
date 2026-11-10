@@ -312,14 +312,17 @@ device/voice/PTT state; they do not trigger a greeting. `/devices` exposes `away
 
 `POST /say` while away returns HTTP 202 with `status: queued_away`, `text`, `bot`,
 `device`, `voice` and `queue_depth`, and records the same in `say.log`. **The calling
-agent should also post the text to chat**; onju has no chat connector. The in-memory
-per-device FIFO survives neither a server restart nor device removal. It holds at
-most 32 entries / 32 MiB (HTTP 429 if full), including WAV requests. Confirmed
-unmute drains it through the normal playback path, in order, waiting while busy
-(including the 60-second unmute listen window). Stale status does not auto-drain
+agent should also post the text to chat**; onju has no chat connector. The chat is
+the record and the pod a second output, so nothing spoken needs an acknowledgement
+and the queue stays short. The in-memory per-device FIFO survives neither a server
+restart nor device removal. Entries older than `say.away.ttl_s` (24 h) are dropped;
+when full (`say.away.max_items`, 32, or 32 MiB, WAV requests included) the oldest is
+dropped. Confirmed unmute drains it through the normal playback path, in order,
+waiting while busy (including the 60-second unmute listen window). With more than
+`say.away.collapse_over` (3) waiting, one intro plays first ("You have 6 updates.
+Here are the latest 3; the rest are in the chat."), then only the newest
+`say.away.keep` (3), each in its own voice. Stale status does not auto-drain
 old entries. New requests join an existing backlog while confirmed present;
 `force: true` bypasses away/backlog, but never the normal busy checks.
 
-Later improvements (not implemented): require explicit user acknowledgement such
-as "roger that" / "got it" (not "thank you") and post unacknowledged announces to
-chat; a locally stored "Mic is muted" WAV on muted taps.
+Later improvement (not implemented): a locally stored "Mic is muted" WAV on muted taps.
