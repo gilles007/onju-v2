@@ -31,5 +31,7 @@ def receive_mute(manager, parts, ip):
             log.info("DEVICE %s AWAY %s", device.hostname, "on" if away else "off")
             device.away_since = time.time() if away else None
         device.away = away
+        if away:
+            device.listen_until = 0.0   # muted: no follow-up window to protect
         device.mute_received_at = time.time()
     return True

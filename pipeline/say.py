@@ -11,6 +11,7 @@ HTTP server (main.py say_server), off unless the config enables it:
       log: "/tmp/tts-debug/say.log"
       tell_agent: true      # pass the text to the agent's next turn
       render: sentence      # or whole (tts.backend local only), see below
+      listen_timeout_s: 20  # mic open this long after a listening say
       away:                 # queue while the pod is muted (all optional)
         ttl_s: 86400        # drop queued announces older than this (0 = keep)
         max_items: 32       # full: the oldest is dropped
@@ -25,7 +26,9 @@ Request (JSON):
      "device": "onju-1415E8",  optional: hostname or IP (default: last pod seen)
      "force": false,          optional: bypass away queue (not busy checks)
      "if_present": false,     optional: skip (do not queue) when the pod is away
-     "listen": false,          optional: open the mic after the final answer
+     "listen": null,           optional: open the mic after the final answer
+                               (default: true with if_present, else false)
+     "listen_s": 20,           optional: that mic window (default say.listen_timeout_s)
      "wait": true,             optional: answer after it was sent (false = at once)
      "filler": "...",          optional: short line before THINKING (same voice)
      "think_s": 3,             optional: seconds of THINKING LEDs after filler
@@ -44,6 +47,13 @@ the wire, but the container doesn't see host paths.
 Staged sequence when filler and/or think_s is set: optional delay → filler →
 THINKING for think_s → answer. Plain announces (text only) are unchanged.
 listen applies only after the final answer; the mic stays closed between parts.
+
+Follow-ups (2026-11-11): an if_present say is a chat reply while the user
+is there, so by default it listens after its last sentence for
+say.listen_timeout_s (20 s; default_mic_timeout is for taps), and the
+answer goes to the bot that spoke (grok-voice). Queued and other says stay
+mic-closed. While a reply's or a say's mic window is open, a new say is
+busy (409) unless force: it would close the mic on the user.
 
 render (2026-10-11): "sentence" (default) renders and sends one sentence at
 a time, like a voice turn. "whole" renders all of a part's sentences first,
@@ -99,6 +109,8 @@ RENDER_MODES = ("sentence", "whole")
 # The pod streams mic packets all the time its mic is open (the server runs
 # the VAD), so packets within this window mean it is listening.
 LISTEN_GRACE_S = 1.5
+LISTEN_TIMEOUT_S = 20          # say.listen_timeout_s: mic window after a listening say
+MAX_LISTEN_S = 120.0
 # Says waiting for the agent's next turn are dropped after this long
 # (grok-bridge forgets a voice history after 1800 s idle, GROK_HISTORY_IDLE).
 MEMORY_TTL_S = 1800.0
@@ -137,6 +149,7 @@ class SayConfig:
         self.log_path = str(cfg.get("log") or DEFAULT_LOG)
         self.tell_agent = bool(cfg.get("tell_agent", True))
         self.max_chars = int(cfg.get("max_chars") or DEFAULT_MAX_CHARS)
+        self.listen_timeout_s = int(cfg.get("listen_timeout_s", LISTEN_TIMEOUT_S) or 0)
         away = cfg.get("away") or {}
         self.away_ttl_s = float(away.get("ttl_s", AWAY_TTL_S) or 0)
         self.away_max = max(1, int(away.get("max_items") or AWAY_MAX_ITEMS))
@@ -231,7 +244,8 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
         "voice": (req.get("voice") or "").strip(),
         "bot": (req.get("bot") or "").strip(),
         "device": (req.get("device") or "").strip(),
-        "listen": bool(req.get("listen", False)),
+        "listen": None if req.get("listen") is None else bool(req["listen"]),
+        "listen_s": int(_opt_seconds(req, "listen_s", MAX_LISTEN_S)),
         "wait": bool(req.get("wait", True)),
         "filler": _opt_text(scfg, req, "filler"),
         "think_s": _opt_seconds(req, "think_s", MAX_THINK_S),
@@ -239,6 +253,16 @@ def parse_request(scfg: SayConfig, body: bytes) -> dict:
         "raw_voice": bool(req.get("raw_voice", False)),
         "wav": wav,              # 16 kHz mono s16 PCM bytes, or None
     }
+
+
+def listen_window(scfg: SayConfig, req: dict, from_queue: bool = False) -> int:
+    """Seconds the mic stays open after the say (0 = closed). "listen" as
+    given; unset, an if_present say listens unless it was queued (played
+    later, maybe to an empty room)."""
+    listen = req["listen"]
+    if listen is None:
+        listen = bool(req.get("if_present")) and not from_queue
+    return (req.get("listen_s") or scfg.listen_timeout_s) if listen else 0
 
 
 def decode_wav(b64) -> bytes:
@@ -420,7 +444,7 @@ def collapse_away(device, scfg) -> int:
 # ---- busy check ----------------------------------------------------------
 
 def busy_reason(device, barge, queued: int = 0, now: float | None = None,
-                *, ignore_owned: bool = False) -> str | None:
+                *, ignore_owned: bool = False, force: bool = False) -> str | None:
     """Why the pod can't take a say right now, or None.
 
     - a say is already running on it;
@@ -428,7 +452,10 @@ def busy_reason(device, barge, queued: int = 0, now: float | None = None,
     - the server estimates it is still playing audio (bargein.py);
     - it is recording (VAD has speech, or a PTT buffer is filling);
     - its mic is open (mic packets within LISTEN_GRACE_S): after a reply the
-      pod listens for default_mic_timeout s, after a tap for 20 s.
+      pod listens for default_mic_timeout s, after a tap for 20 s;
+    - its mic window is open (device.listen_until, set by stream_sentence
+      when a final sentence opens the mic; packets only come with speech
+      on some firmware). force skips only this one.
 
     ignore_owned: skip the say_active / processing checks. Used after a
     staged delay_s, when this say already claimed the pod and is about to
@@ -450,6 +477,8 @@ def busy_reason(device, barge, queued: int = 0, now: float | None = None,
     last_mic = getattr(device, "last_mic_at", 0.0) or 0.0
     if now - last_mic < LISTEN_GRACE_S:
         return f"the pod is listening (mic open, last packet {now - last_mic:.1f}s ago)"
+    if not force and time.monotonic() < (getattr(device, "listen_until", 0.0) or 0.0):
+        return "the pod is listening for a follow-up"
     return None
 
 

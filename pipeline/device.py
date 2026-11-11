@@ -31,6 +31,7 @@ class Device:
         self.led_update_time = 0.0
         self.last_mic_at = 0.0      # time.time() of the last mic packet (say busy check)
         self.say_active = False     # a POST /say is playing (pipeline/say.py)
+        self.listen_until = 0.0     # time.monotonic() until which its mic window is open
         self.last_heard_at = 0.0    # time.time() of the last packet FROM the pod (UDP mic/VOX,
                                     # multicast announce); picks the default /say target
 

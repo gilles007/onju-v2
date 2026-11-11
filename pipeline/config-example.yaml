@@ -200,6 +200,8 @@ network:
 #   render: sentence                         # sentence (default): render+play one sentence at a time;
 #                                            # whole: render all sentences, then play them back to back
 #                                            # (no gaps); only with tts.backend local, ignored otherwise
+#   listen_timeout_s: 20                     # mic open this long after a listening say (if_present
+#                                            # says listen by default; "listen": false turns it off)
 #   away:                                    # announces queued while the pod is muted (chat is the record)
 #     ttl_s: 86400                           # drop entries older than this (default 24 h; 0 = keep)
 #     max_items: 32                          # full: the oldest is dropped

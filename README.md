@@ -323,12 +323,19 @@ waiting while busy (including the 60-second unmute listen window). With more tha
 Here are the latest 3; the rest are in the chat."), then only the newest
 `say.away.keep` (3), each in its own voice. Stale status does not auto-drain
 old entries. New requests join an existing backlog while confirmed present;
-`force: true` bypasses away/backlog, but never the normal busy checks.
+`force: true` bypasses away/backlog, but never the normal busy checks (only the
+follow-up window below).
 `if_present: true` (chat echoes of a live conversation) skips instead of
 queueing when the pod is muted: HTTP 200 with `status: skipped_away`, `text`,
 `bot`, `device`, `voice` and `queue_depth` (unchanged), also recorded in
 `say.log`. Spontaneous announces omit the flag and still queue. `force` wins
 if both are set. A present pod with a backlog still queues an if_present
 request (it will be said). Stale/unknown status does not skip.
+
+Follow-ups: an `if_present` say listens after its last sentence for
+`say.listen_timeout_s` (20 s; `"listen": false` turns it off, `listen_s` overrides),
+so the user can answer; on grok-voice the answer goes to the bot that spoke. Queued
+says stay mic-closed. While the mic window of a reply or a say is open, a new say
+gets 409 ("listening for a follow-up") unless `force`; queued ones wait.
 
 Later improvement (not implemented): a locally stored "Mic is muted" WAV on muted taps.

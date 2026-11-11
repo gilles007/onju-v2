@@ -370,13 +370,13 @@ async def test_happy():
               st == 200 and dev.hostname in body["devices"]
               and body["agents"]["robin"] == "tim-allen", f"{st} {body}")
 
-    # listen=true: last header carries the default mic timeout, no 0xDD.
+    # listen=true: last header carries say.listen_timeout_s, no 0xDD.
     async with Env() as env:
         st, body = await http(env.port, "POST", "/say",
                               {"text": f"{TAG} one. {TAG} two.", "voice": "pepper", "listen": True})
         await asyncio.sleep(0.2)
         check("listen: last sentence opens the mic, no 0xDD after it",
-              st == 200 and [c["mic"] for c in env.pod.audio()] == [0, MIC]
+              st == 200 and [c["mic"] for c in env.pod.audio()] == [0, say.LISTEN_TIMEOUT_S]
               and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd", "audio"],
               f"{st} {env.pod.conns}")
 
@@ -653,7 +653,7 @@ async def test_staged():
         await asyncio.sleep(0.2)
         mics = [c["mic"] for c in env.pod.audio()]
         check("staged+listen: filler mic 0 (+0xDD), answer opens mic, no 0xDD after it",
-              st == 200 and mics == [0, MIC]
+              st == 200 and mics == [0, say.LISTEN_TIMEOUT_S]
               and [c["kind"] for c in env.pod.conns] == ["audio", "mic_cmd", "audio"],
               f"{st} {mics} {env.pod.conns}")
 
@@ -855,7 +855,7 @@ async def test_wav():
         lines = env.log_lines()
         check("wav + filler + listen: TTS only for the filler, wav last with the mic timeout",
               st == 200 and [c for c, _ in env.tts.calls] == [f"{TAG} one sec."]
-              and [c["mic"] for c in audio] == [0, MIC] and audio[1]["frames"] == 2,
+              and [c["mic"] for c in audio] == [0, say.LISTEN_TIMEOUT_S] and audio[1]["frames"] == 2,
               f"{st} {body} {env.tts.calls} {env.pod.conns}")
         check("wav + filler: the TTS filler's debug WAV is still saved",
               bool(glob.glob(f"/tmp/tts-debug/*{TAG}_one_sec*.wav")),
@@ -951,10 +951,80 @@ def test_default_target_ties_go_to_last_added():
     pf.check("default target", DeviceManager({}).get_most_recent() is None)
 
 
+async def test_follow_up():
+    """if_present says listen (say.listen_timeout_s), and an open mic window
+    (after a reply or a listening say) makes new says busy unless force."""
+    two = f"{TAG} one. {TAG} two."
+
+    async def mics(env, payload):
+        env.pod.conns.clear()
+        st, body = await http(env.port, "POST", "/say", payload)
+        await asyncio.sleep(0.2)
+        m.bargein._by_host.clear()        # forget the playback estimate
+        return st, [c["mic"] for c in env.pod.audio()], [c["kind"] for c in env.pod.conns]
+
+    async with Env() as env:
+        dev = env.devices[0]
+        st, mic, kinds = await mics(env, {"text": two, "if_present": True})
+        check("follow-up: if_present listens after the last sentence (20 s), no 0xDD after it",
+              st == 200 and mic == [0, 20] and kinds == ["audio", "mic_cmd", "audio"], f"{st} {mic} {kinds}")
+        check("follow-up: mic window recorded on the device",
+              dev.listen_until > time.monotonic() + 15, f"{dev.listen_until - time.monotonic():.1f}")
+        env.pod.conns.clear()
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} stomp."})
+        check("follow-up: another say during the window -> 409, nothing sent",
+              st == 409 and "follow-up" in body["reason"] and not env.pod.audio(), f"{st} {body}")
+        st, mic, kinds = await mics(env, {"text": f"{TAG} forced.", "force": True})
+        check("follow-up: force plays through the window (mic closed, window cleared)",
+              st == 200 and mic == [0] and dev.listen_until == 0.0, f"{st} {mic} {dev.listen_until}")
+        st, mic, kinds = await mics(env, {"text": two, "if_present": True, "listen": False})
+        check("follow-up: if_present with listen false stays mic-closed",
+              st == 200 and mic == [0, 0] and kinds == ["audio", "mic_cmd", "audio", "mic_cmd"],
+              f"{st} {mic} {kinds}")
+        st, mic, kinds = await mics(env, {"text": two})
+        check("follow-up: plain say unchanged (mic closed)", st == 200 and mic == [0, 0], f"{st} {mic}")
+        st, mic, _ = await mics(env, {"text": f"{TAG} short.", "if_present": True, "listen_s": 12})
+        check("follow-up: listen_s overrides the window", st == 200 and mic == [12], f"{st} {mic}")
+        await m.mic_off(dev, env.pod.port, "test")
+        check("follow-up: mic off clears the window", dev.listen_until == 0.0)
+
+        # The 2026-11-11 bug: a reply's final sentence opened the mic for 60 s,
+        # no speech packets came, and a say closed the mic on the user.
+        dev.listen_until = time.monotonic() + 30
+        st, body = await http(env.port, "POST", "/say", {"text": f"{TAG} hi.", "if_present": True})
+        check("follow-up: say during a reply's mic window -> 409",
+              st == 409 and "follow-up" in body["reason"], f"{st} {body}")
+        dev.listen_until = time.monotonic() - 1
+        st, mic, _ = await mics(env, {"text": f"{TAG} later."})
+        check("follow-up: window over -> plays", st == 200 and mic == [0], f"{st} {mic}")
+
+    async with Env(listen_timeout_s=7) as env:
+        st, mic, _ = await mics(env, {"text": f"{TAG} short.", "if_present": True})
+        check("follow-up: say.listen_timeout_s sets the window", st == 200 and mic == [7], f"{st} {mic}")
+
+    # A reply's final sentence (voice turn path) records its window too.
+    async with Env() as env:
+        dev = env.devices[0]
+        ok, _ = await m.stream_sentence(env.config, dev, f"{TAG} reply.", is_final=True,
+                                        turn_t0=time.monotonic())
+        check("follow-up: final reply sentence (default_mic_timeout) records the window",
+              ok and dev.listen_until > time.monotonic() + MIC - 5, f"{dev.listen_until - time.monotonic():.1f}")
+
+    scfg = say.SayConfig({})
+    req = say.parse_request(scfg, json.dumps({"text": "x", "if_present": True}).encode())
+    check("follow-up: listen unset -> None; queued if_present say stays closed",
+          req["listen"] is None and say.listen_window(scfg, req) == 20
+          and say.listen_window(scfg, req, from_queue=True) == 0, f"{req}")
+    req = say.parse_request(scfg, json.dumps({"text": "x", "listen": True}).encode())
+    check("follow-up: explicit listen keeps listening even when queued",
+          say.listen_window(scfg, req, from_queue=True) == 20)
+
+
 async def main():
     await test_disabled()
     await test_refusals()
     await test_happy()
+    await test_follow_up()
     await test_staged()
     await test_turn_note()
     test_resolve()
