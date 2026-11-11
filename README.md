@@ -288,8 +288,10 @@ MIT
 On boards with a mute switch (not BOARD_V1), HIGH means muted/away. The
 switch is debounced for 50 ms in a small task so playback cannot delay it.
 Mic capture/transmission stops locally; server availability is not needed.
-Mute gives a slow red fade; unmute gives a green fade and retains the existing
-60-second mic-open window. A muted tap does not open the mic: the four middle
+Mute gives a slow red fade; unmute gives a green fade and leaves the mic
+closed (tap to talk). The side LEDs (pixels 0 and 5) show status: steady dim red
+while muted, slow blue breathing while the mic is open, off otherwise
+(`SIDE_*` in onjuino.ino). A muted tap does not open the mic: the four middle
 LEDs flash red for 150 ms, dark for 150 ms, red for 150 ms, then dark (LED-frame
 resolution, about 25 ms). A tap before server discovery keeps its old orange
 indication when not muted.
@@ -310,7 +312,7 @@ and the queue stays short. The in-memory per-device FIFO survives neither a serv
 restart nor device removal. Entries older than `say.away.ttl_s` (24 h) are dropped;
 when full (`say.away.max_items`, 32, or 32 MiB, WAV requests included) the oldest is
 dropped. Confirmed unmute drains it through the normal playback path, in order,
-waiting while busy (including the 60-second unmute listen window). With more than
+waiting while busy. With more than
 `say.away.collapse_over` (3) waiting, one intro plays first ("You have 6 updates.
 Here are the latest 3; the rest are in the chat."), then only the newest
 `say.away.keep` (3), each in its own voice. Stale status does not auto-drain
