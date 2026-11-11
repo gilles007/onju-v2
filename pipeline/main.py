@@ -738,7 +738,8 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
     return True, n_frames
 
 
-async def process_utterances(config: dict, manager: DeviceManager, utterance_queue: asyncio.Queue):
+async def process_utterances(config: dict, manager: DeviceManager, utterance_queue: asyncio.Queue,
+                             router: "agents.AgentRouter | None" = None):
     """Process complete utterances: ASR -> Conversation -> TTS -> Opus -> TCP.
 
     Add-on while thinking (2026-10-19): a VOX turn keeps the server listening
@@ -757,7 +758,8 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
     dev_cfg = config["device"]
     no_speech_threshold = 0.45
     # Multi-agent routing (2026-09-27): None unless the config has `agents:`.
-    router = agents.router_from_config(config)
+    # main() passes the one say_server uses too (a listening say's follow-up).
+    router = router or agents.router_from_config(config)
 
     while True:
         device, audio_int16 = await utterance_queue.get()
@@ -1640,6 +1642,13 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
         filler_text=req["filler"], think_s=req["think_s"], delay_s=req["delay_s"],
         barge=barge, utterance_queue=utterance_queue, answer_pcm=answer_pcm,
         tell=tell and bool(req["text"])))
+    if listen_s and router is not None and bot in router.agents:
+        # The answer to a listening say goes to the bot that spoke.
+        def follow(t: asyncio.Task):
+            if not t.cancelled() and t.exception() is None and t.result()["status"] == "played":
+                router.follow(device.hostname, bot)
+                log.info(f"AGENT {bot} takes the follow-up on {device.hostname} (listening say)")
+        task.add_done_callback(follow)
     if not req["wait"]:
         _say_tasks.add(task)
         task.add_done_callback(_say_tasks.discard)
@@ -1751,10 +1760,11 @@ def _http_json(writer: asyncio.StreamWriter, status: int, obj) -> None:
 
 
 async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | None,
-                     ready: asyncio.Event | None = None):
+                     ready: asyncio.Event | None = None,
+                     router: "agents.AgentRouter | None" = None):
     """POST /say and GET /say on say.host:say.port (only when say.enabled)."""
     scfg = say_mod.SayConfig.from_config(config)
-    router = agents.router_from_config(config)
+    router = router or agents.router_from_config(config)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -1923,16 +1933,17 @@ async def main(config_path: str = None, do_warmup: bool = False, devices: list[s
         await warmup(config)
 
     utterance_queue = asyncio.Queue()
+    router = agents.router_from_config(config)   # shared: turns and says
 
     _log_startup_summary(config)
     tasks = [
         udp_listener(config, manager, utterance_queue),
         multicast_listener(config, manager),
-        process_utterances(config, manager, utterance_queue),
+        process_utterances(config, manager, utterance_queue, router),
         control_server(config, manager),
     ]
     if say_mod.SayConfig.from_config(config).enabled:
-        tasks.append(say_server(config, manager, utterance_queue))
+        tasks.append(say_server(config, manager, utterance_queue, router=router))
     else:
         log.info("SAY   disabled (say.enabled is not set)")
     await asyncio.gather(*tasks)

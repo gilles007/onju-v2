@@ -218,7 +218,9 @@ class Env:
         m.OpusStreamEncoder = pf.FakeEncoder
         self.manager = FakeManager(*self.devices)
         ready = asyncio.Event()
-        self.server = asyncio.create_task(m.say_server(self.config, self.manager, self.queue, ready))
+        self.router = m.agents.router_from_config(self.config)
+        self.server = asyncio.create_task(m.say_server(self.config, self.manager, self.queue, ready,
+                                                       router=self.router))
         await asyncio.wait_for(ready.wait(), 5)
         return self
 
@@ -1009,6 +1011,25 @@ async def test_follow_up():
                                         turn_t0=time.monotonic())
         check("follow-up: final reply sentence (default_mic_timeout) records the window",
               ok and dev.listen_until > time.monotonic() + MIC - 5, f"{dev.listen_until - time.monotonic():.1f}")
+
+    # The answer goes to the bot that just spoke (only for listening says).
+    async with Env() as env:
+        dev = env.devices[0]
+        env.router.route(dev.hostname, "Hey Robin, hi.")
+        st, mic, _ = await mics(env, {"text": f"{TAG} hi.", "bot": "pepper"})
+        check("follow-up: non-listening say leaves routing alone",
+              st == 200 and env.router.current(dev.hostname) == "robin", f"{st} {mic}")
+        st, mic, _ = await mics(env, {"text": f"{TAG} brief.", "bot": "data", "if_present": True})
+        dev.listen_until = 0.0
+        rt = env.router.route(dev.hostname, "Thanks, and tomorrow?")
+        check("follow-up: listening say makes its bot sticky; the answer goes to it",
+              st == 200 and mic == [20] and (rt.agent, rt.reason) == ("data", "sticky"), f"{st} {mic} {rt}")
+        st, mic, _ = await mics(env, {"text": f"{TAG} hey.", "voice": "tim-allen", "raw_voice": True,
+                                      "if_present": True, "wait": False})
+        await asyncio.sleep(0.5)
+        dev.listen_until = 0.0
+        check("follow-up: wait=false listening say also hands over (robin by voice)",
+              st == 200 and env.router.current(dev.hostname) == "robin", f"{st} {env.router.current(dev.hostname)}")
 
     scfg = say.SayConfig({})
     req = say.parse_request(scfg, json.dumps({"text": "x", "if_present": True}).encode())

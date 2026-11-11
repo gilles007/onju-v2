@@ -178,6 +178,12 @@ def test_sticky():
     r.touch("c", now=100)       # the reply played until t=100
     rt = r.route("c", "Go on.", now=150)
     check("sticky: touch() at turn end restarts the clock", rt.agent == "data", f"{rt}")
+    r.route("d", "Hey Robin, hi.", now=0)
+    check("follow: a known agent becomes sticky", r.follow("d", "data", now=200))
+    rt = r.route("d", "Sure, go ahead.", now=230)
+    check("follow: the next turn goes to it", (rt.agent, rt.reason) == ("data", "sticky"), f"{rt}")
+    check("follow: unknown agent changes nothing",
+          not r.follow("d", "zed", now=231) and r.current("d") == "data")
 
 
 def test_voices():

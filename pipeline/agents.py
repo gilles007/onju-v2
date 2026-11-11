@@ -279,6 +279,14 @@ class AgentRouter:
         if prev is not None:
             self._state[device_id] = (prev[0], time.monotonic() if now is None else now)
 
+    def follow(self, device_id: str, agent: str, now: float | None = None) -> bool:
+        """Make `agent` the sticky one on this pod, as if it had just
+        answered a turn (after a listening say). Unknown agent: no change."""
+        if agent not in self.agents:
+            return False
+        self._state[device_id] = (agent, time.monotonic() if now is None else now)
+        return True
+
     def current(self, device_id: str) -> str | None:
         prev = self._state.get(device_id)
         return prev[0] if prev else None
