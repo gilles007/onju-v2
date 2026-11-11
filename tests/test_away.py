@@ -313,6 +313,13 @@ async def test_if_present():
         check("if_present queues behind backlog when present",
               status == 202 and r["status"] == "queued_away" and len(d.say_queue) == 2
               and json.loads(d.say_queue[-1][1])["text"] == "After backlog.", r)
+        # The stale if_present say listened: its mic window holds the queue.
+        m.bargein._by_host.clear()
+        await m.flush_away_queue(e.config, say.SayConfig.from_config(e.config),
+                                 None, e.manager, e.queue)
+        check("queued announces wait out a follow-up window",
+              len(d.say_queue) == 2 and d.listen_until > time.monotonic())
+        d.listen_until = 0.0
         # Drain the backlog so the next if_present can play.
         for _ in range(2):
             m.bargein._by_host.clear()

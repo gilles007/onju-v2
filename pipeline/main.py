@@ -90,6 +90,8 @@ ADDON_GAP_S = 0.3
 async def mic_off(device, port: int, why: str, hold_s: int = 0) -> None:
     """0xDD hold_s: 0 closes the pod's mic, N holds it open N s from now."""
     what = "off" if hold_s == 0 else f"open {hold_s}s"
+    if hold_s == 0:
+        device.listen_until = 0.0   # no follow-up window (say busy check)
     try:
         await asyncio.wait_for(send_stop_listening(device.ip, port, hold_s), MIC_OFF_TIMEOUT_S)
         log.debug(f"MIC  {what} for {device.hostname} ({why})")
@@ -696,6 +698,11 @@ async def stream_sentence(config: dict, device, sentence: str, *, is_final: bool
             # pod to close its end once it has played this sentence.
             confirm_pod_close(writer, device, sentence, n_frames,
                               max(0.0, barge.playing_until - time.monotonic()))
+            # Follow-up window: the pod listens mic_timeout s once this has
+            # played. A say must not close it (busy_reason); 0 = none.
+            open_mic = (mic_timeout > 0 and not device.ptt and not cancelled
+                        and not device.interrupted.is_set())
+            device.listen_until = barge.playing_until + mic_timeout if open_mic else 0.0
             if (mic_timeout == 0 and not device.ptt and not cancelled
                     and not device.interrupted.is_set()):
                 # Keep the mic closed after this sentence (the next one, or
@@ -754,6 +761,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
         device, audio_int16 = await utterance_queue.get()
 
         device.processing = True
+        device.listen_until = 0.0
         device.interrupted.clear()
         bargein.for_device(device, config).new_turn()
         device.turn_seq = getattr(device, "turn_seq", 0) + 1
@@ -785,6 +793,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 # header now would stop it (playback + holdoff).
                 return
             mic_reopened = True
+            device.listen_until = time.monotonic() + dev_cfg["default_mic_timeout"]
             try:
                 await send_audio(device.ip, tcp_port, b"",
                                  mic_timeout=dev_cfg["default_mic_timeout"],
@@ -1316,10 +1325,12 @@ async def _say_render(config: dict, device, sentences: list[str], tts_kwargs: di
 
 async def _say_stream_part(config: dict, device, sentences: list[str], *,
                            t0: float, tts_kwargs: dict, listen: bool,
+                           listen_s: int | None = None,
                            stall: bool = False,
                            rendered: list[list[bytes]] | None = None,
                            save_debug: bool = True) -> tuple[bool, int, int]:
-    """Stream sentences; listen only on the last if listen. Returns
+    """Stream sentences; listen only on the last if listen (for listen_s,
+    default default_mic_timeout). Returns
     (ok, frames, played_count). stall: filler lines (debug WAV name only).
     rendered: audio from _say_render (say render: whole), one entry per
     sentence from the first; sentences without one call the TTS."""
@@ -1329,7 +1340,7 @@ async def _say_stream_part(config: dict, device, sentences: list[str], *,
     ok = True
     for i, sentence in enumerate(sentences):
         last = i == len(sentences) - 1
-        mic = config["device"]["default_mic_timeout"] if (last and listen) else 0
+        mic = (listen_s or config["device"]["default_mic_timeout"]) if (last and listen) else 0
         ok, n = await stream_sentence(config, device, sentence, is_final=last,
                                       turn_t0=t0, tts_kwargs=tts_kwargs, mic_timeout=mic,
                                       stall=stall,
@@ -1344,7 +1355,7 @@ async def _say_stream_part(config: dict, device, sentences: list[str], *,
 
 async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
                    sentences: list[str], text: str, tts_voice: str | None,
-                   bot: str | None, listen: bool = False,
+                   bot: str | None, listen: bool = False, listen_s: int | None = None,
                    filler_sentences: list[str] | None = None,
                    filler_text: str | None = None,
                    think_s: float = 0.0, delay_s: float = 0.0,
@@ -1398,6 +1409,7 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
              f"{f', filler={filler_text!r}' if filler_text else ''}"
              f"{f', think_s={think_s:g}' if think_s else ''}"
              f"{f', delay_s={delay_s:g}' if delay_s else ''}"
+             f"{f', listen {listen_s}s' if listen and listen_s else ''}"
              f": {text!r}")
     try:
         if delay_s > 0:
@@ -1435,6 +1447,7 @@ async def play_say(config: dict, scfg: "say_mod.SayConfig", device,
             # Final part of a multi-stage say, or the only part of a plain one.
             ok, n, played = await _say_stream_part(
                 config, device, sentences, t0=t0, tts_kwargs=tts_kwargs, listen=listen,
+                listen_s=listen_s,
                 rendered=([answer_pcm] if answer_pcm is not None
                           else answer_render.result() if answer_render else None),
                 save_debug=answer_pcm is None)
@@ -1536,9 +1549,10 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
         if req.get("if_present") and away is True:
             return say_mod.skip_away(device, req, bot, tts_voice, scfg)
         return say_mod.queue_away(device, body, req, bot, tts_voice, scfg)
+    listen_s = say_mod.listen_window(scfg, req, from_queue)
     barge = bargein.for_device(device, config)
     queued = utterance_queue.qsize() if utterance_queue is not None else 0
-    reason = say_mod.busy_reason(device, barge, queued)
+    reason = say_mod.busy_reason(device, barge, queued, force=req["force"])
     if reason:
         log.info(f"SAY   refused for {device.hostname}: {reason}")
         raise say_mod.SayError(409, {"error": "busy", "reason": reason, "device": device.hostname})
@@ -1570,7 +1584,7 @@ async def say_request(config: dict, scfg: "say_mod.SayConfig", router, manager,
         raise
     task = asyncio.create_task(play_say(
         config, scfg, device, sentences, req["text"] or sentences[0], tts_voice, bot,
-        listen=req["listen"], filler_sentences=filler_sentences,
+        listen=bool(listen_s), listen_s=listen_s, filler_sentences=filler_sentences,
         filler_text=req["filler"], think_s=req["think_s"], delay_s=req["delay_s"],
         barge=barge, utterance_queue=utterance_queue, answer_pcm=answer_pcm,
         tell=tell and bool(req["text"])))
@@ -1727,7 +1741,8 @@ async def say_server(config: dict, manager, utterance_queue: asyncio.Queue | Non
         return
     log.info(f"SAY   listening on {scfg.host}:{scfg.port} (POST /say)"
              f"{' with token' if scfg.token else ''}"
-             f"{', render=whole' if say_mod.render_whole(scfg, config) else ''}")
+             f"{', render=whole' if say_mod.render_whole(scfg, config) else ''}"
+             f", listen_timeout_s={scfg.listen_timeout_s}")
     if scfg.render == "whole" and not say_mod.render_whole(scfg, config):
         log.warning(f"SAY   render: whole has no effect with tts.backend "
                     f"{config.get('tts', {}).get('backend')!r} (only local); rendering per sentence")
