@@ -153,6 +153,16 @@ static const float BASE_GLOW     = 0.01f;  // minimum brightness (0..1)
 static const float COMET_WIDTH   = 2.0f;   // comet falloff distance, in LED units
 static const float LED_GAMMA     = 1.2f;   // gamma for bare LEDs
 
+// (20261111) Side status LEDs: pixels 0 and 5, which no other effect uses.
+// Muted (away): steady red. Mic open: slow blue breathing. Otherwise off.
+// Muted wins. Levels are perceived (0..255 before gammaCorrectionTable, like
+// the ledLevel pulses), so 38 = ~15% looks like 15%, not like half brightness.
+#define SIDE_LED_LEFT        0
+#define SIDE_LED_RIGHT       5
+#define SIDE_AWAY_LEVEL      38    // ~15%, red while muted
+#define SIDE_LISTEN_PEAK     64    // ~25%, peak of the blue breathing
+#define SIDE_LISTEN_PERIOD_MS 2000 // one full breath
+
 // Gradient: green -> blue -> purple -> coral -> yellow (cyclic)
 static const uint8_t PALETTE[][3] = {
     {0x26, 0xD3, 0x66},
@@ -322,7 +332,7 @@ void muteTask(void *parameter)
                 setLed(255, 0, 0, 255, 2); // slow red fade
             } else {
                 setLed(0, 255, 50, 255, 10);
-                mic_timeout = now + 60000; // preserve 60 s listen on unmute
+                mic_timeout = 0; // (20261111) unmute leaves the mic closed (tap to talk); a 60 s window held queued announces
             }
         }
         if (first || changed || now - sentAt >= 10000) {
@@ -816,7 +826,7 @@ void loop()
         case 'L':
             Serial.println("[UART] LED's all on max brightness (white)");
             setLed(0, 0, 0, 0, 0); // stop ramping down function from running
-            for (int i = 0; i < 6; i++)
+            for (int i = 1; i < 5; i++) // side pixels 0/5 belong to drawSideLeds()
             {
                 leds.setPixelColor(i, 255, 255, 255);
             }
@@ -824,7 +834,7 @@ void loop()
             break;
         case 'l':
             Serial.println("[UART] LED's all off");
-            for (int i = 0; i < 6; i++)
+            for (int i = 1; i < 5; i++) // side pixels 0/5 belong to drawSideLeds()
             {
                 leds.setPixelColor(i, 0, 0, 0);
             }
@@ -913,7 +923,8 @@ void loop()
                 // 20260819 LED Animation - Update state. Leaving THINKING:
                 // updateLedTask clears the chase pixels on its next tick.
                 visualState = VS_SPEAKING;
-                leds.clear();
+                for (int i = 1; i < 5; i++) // keep the side status (pixels 0/5)
+                    leds.setPixelColor(i, 0, 0, 0);
                 leds.show();
                 uint16_t timeout = header[1] << 8 | header[2];
                 speaker_volume = header[3];
@@ -1134,7 +1145,7 @@ void loop()
             {
                 Serial.println("Received custom LED command (0xBB)");
                 setLed(0, 0, 0, 0, 0);
-                uint8_t bitmask = header[1];
+                uint8_t bitmask = header[1] & 0x1E; // pixels 1..4; 0/5 are the side status
                 for (int i = 0; i < 6; i++)
                 {
                     if (bitmask & (1 << i))
@@ -1543,6 +1554,32 @@ void micTask(void *pvParameters)
     }
 }
 
+// (20261111) Side status (see SIDE_*). Sets pixels 0/5, returns true if they
+// changed; the caller shows. Compares against the strip buffer, so anything that
+// cleared them is redrawn on the next tick.
+bool drawSideLeds()
+{
+    uint8_t r = 0, b = 0;
+    bool micOpen = deviceEnabled && !isPlaying &&
+                   (PTT_MODE ? pttHeld : mic_timeout > millis());
+    if (mute)
+    {
+        r = gammaCorrectionTable[SIDE_AWAY_LEVEL];
+    }
+    else if (micOpen)
+    {
+        float phase = (float)(millis() % SIDE_LISTEN_PERIOD_MS) / SIDE_LISTEN_PERIOD_MS;
+        uint8_t level = (uint8_t)(SIDE_LISTEN_PEAK * 0.5f * (1.0f - cosf(2.0f * (float)M_PI * phase)) + 0.5f);
+        b = gammaCorrectionTable[level];
+    }
+    uint32_t c = leds.Color(r, 0, b);
+    if (leds.getPixelColor(SIDE_LED_LEFT) == c && leds.getPixelColor(SIDE_LED_RIGHT) == c)
+        return false;
+    leds.setPixelColor(SIDE_LED_LEFT, c);
+    leds.setPixelColor(SIDE_LED_RIGHT, c);
+    return true;
+}
+
 void updateLedTask(void *parameter)
 {
     Serial.println("Started updateLedTask");
@@ -1557,12 +1594,15 @@ void updateLedTask(void *parameter)
     {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
+        // Side status first: every leds.show() below sends it too.
+        bool sideChanged = drawSideLeds();
+        bool shown = false;
+
         // Muted tap: red 150 ms, dark 150 ms, red 150 ms, then dark.
         // LED-task timing avoids blocking touch, mic, or the playback loop.
         if (mutedTapFlash) {
             uint32_t elapsed = millis() - mutedTapStart;
             bool on = elapsed < 150 || (elapsed >= 300 && elapsed < 450);
-            leds.clear();
             for (int i = 1; i < 5; i++)
                 leds.setPixelColor(i, on ? 255 : 0, 0, 0);
             leds.show();
@@ -1596,6 +1636,7 @@ void updateLedTask(void *parameter)
                 leds.setPixelColor(i, 0, 0, 0);
             }
             leds.show();
+            shown = true;
             chaseOn = false;
         }
 
@@ -1617,6 +1658,7 @@ void updateLedTask(void *parameter)
                 leds.setPixelColor(ANIM_FIRST_LED + i, frame[i][0], frame[i][1], frame[i][2]);
             }
             leds.show();
+            shown = true;
         }
         else if (ledLevel > 0)
         {
@@ -1645,7 +1687,10 @@ void updateLedTask(void *parameter)
                                    ledColor[2] * adjustedLedLevel / 255);
             }
             leds.show();
+            shown = true;
         }
+        if (sideChanged && !shown)
+            leds.show();
     }
 }
 
