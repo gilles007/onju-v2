@@ -156,11 +156,11 @@ static const float LED_GAMMA     = 1.2f;   // gamma for bare LEDs
 // (20261111) Side status LEDs: pixels 0 and 5, which no other effect uses.
 // Muted (away): steady red. Mic open: slow blue breathing. Otherwise off.
 // Muted wins. Levels are perceived (0..255 before gammaCorrectionTable, like
-// the ledLevel pulses), so 38 = ~15% looks like 15%, not like half brightness.
+// the ledLevel pulses), so 128 = ~50% looks like half brightness. (20261111 pm) Raised from 15%/25%.
 #define SIDE_LED_LEFT        0
 #define SIDE_LED_RIGHT       5
-#define SIDE_AWAY_LEVEL      38    // ~15%, red while muted
-#define SIDE_LISTEN_PEAK     64    // ~25%, peak of the blue breathing
+#define SIDE_AWAY_LEVEL      128   // ~50%, red while muted
+#define SIDE_LISTEN_PEAK     128   // ~50%, peak of the blue breathing
 #define SIDE_LISTEN_PERIOD_MS 2000 // one full breath
 
 // Gradient: green -> blue -> purple -> coral -> yellow (cyclic)
