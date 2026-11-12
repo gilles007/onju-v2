@@ -349,7 +349,8 @@ void muteTask(void *parameter)
                 ok = statusUdp.endPacket();
             }
             // Boot, changes and failures always; the 10 s refresh once a minute.
-            if (first || changed || !ok || now - loggedAt >= 60000) {
+            // if (first || changed || !ok || now - loggedAt >= 60000) {
+            if (first || changed || !ok) {   // Gilles: Log only on change (don't fill log with MUTE messages)
                 Serial.printf("[MUTE] sent MUTE %d %s %s:%d%s\n", mute ? 1 : 0,
                               unicast ? "unicast" : "multicast", dst.toString().c_str(),
                               PORT_MULTICAST, ok ? "" : " FAILED");
